@@ -1,8 +1,15 @@
 {
-  "name": "confecciones-millar",
+  "name": "control-piso-millar",
   "version": "1.0.0",
-  "description": "Control de piso Confecciones Millar",
+  "description": "Control de Piso - Confecciones Millar",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "ws": "^8.18.0" }
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
