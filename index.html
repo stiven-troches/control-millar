@@ -1027,7 +1027,7 @@ let iaState   = null;
 let iaRecords = [];
 let iaReady   = false;
 // Timeout de seguridad: si el WS no responde en 8s, liberar igualmente
-setTimeout(()=>{ if(!iaReady){ console.warn('iaReady timeout — liberando sin datos del servidor'); iaReady=true; } }, 8000);
+setTimeout(()=>{ if(!iaReady){ console.warn('iaReady timeout — liberando sin datos del servidor'); iaReady=true; } }, 1500);
 
 function iaSaveState(){
   wsSend({ type: 'ia_save_state', state: JSON.parse(JSON.stringify(iaState)) });
@@ -1089,9 +1089,9 @@ function connectWS(){
         }
         iaReady = true;
         updateStats();
-        // Siempre renderizar al recibir init para evitar pantalla en blanco
-        renderGrid();
-        if(currentView==='single') renderBig();
+        // Siempre renderizar al recibir init — usar setView para garantizar que grid-view sea visible
+        if(currentView==='grid') setView('grid');
+        else if(currentView==='single') renderBig();
 
       } else if(msg.type==='modules_config'){
         // Solo actualizar memoria — NO guardar en servidor
@@ -1101,7 +1101,7 @@ function connectWS(){
         _appConfig._modulos_pass=msg.modPass||{};
         rebuildModules();
         updateStats();
-        if(currentView==='grid') renderGrid();
+        if(currentView==='grid') setView('grid');
         if(typeof iaBuildAreaSelect==='function') iaBuildAreaSelect();
       } else if(msg.type==='change'){
         const id=msg.id, s=msg.state;
@@ -1710,14 +1710,10 @@ function entrarTablero(){
     const el = document.getElementById('stat-'+c);
     if(el) el.classList.remove('active-filter');
   });
-  // Esperar a que el WS haya enviado el init antes de renderizar
-  function doEnter(){
-    setView('grid');
-    setTimeout(()=>{ if(currentView==='grid') renderGrid(); }, 50);
-    setTimeout(()=>{ if(currentView==='grid') renderGrid(); }, 400);
-  }
-  if(iaReady){ doEnter(); }
-  else { iaWaitReady(doEnter); }
+  // Entrar de inmediato — el WS actualizará estados cuando conecte
+  setView('grid');
+  // Re-renderizar cuando lleguen datos del servidor
+  setTimeout(()=>{ if(currentView==='grid') renderGrid(); }, 400);
 }
 function abrirModtable(){
   const grid=document.getElementById('modtable-grid');grid.innerHTML='';
