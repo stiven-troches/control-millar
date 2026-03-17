@@ -1016,6 +1016,8 @@ MODULES.forEach(id=>{ states[id]='green'; timers[id]=Date.now(); lastMec[id]='';
 let selectedMod=null, activeFilters=new Set(), currentView=null, pendingTransicion=null, currentUser=null;
 // Módulos ocultos por el usuario (persiste en localStorage)
 let hiddenMods=new Set(JSON.parse(localStorage.getItem('hiddenMods')||'[]'));
+// Si todos los módulos están ocultos (estado inválido), resetear visibilidad
+if(hiddenMods.size >= MODULES.length){ hiddenMods.clear(); localStorage.removeItem('hiddenMods'); }
 // ── Helpers de permisos ─────────────────────────────────────────────
 function hasPerm(p){ return currentUser&&USUARIOS[currentUser]&&USUARIOS[currentUser].perms.includes(p); }
 function isProg(){ return hasPerm('fix')&&hasPerm('modulos')&&hasPerm('tablero'); }
@@ -2605,8 +2607,11 @@ function rebuildModules(){
   const cfg=loadConfig();
   const base=['M01','M02','M03','M04','M05','M06','M07','M08','M09','M10','M11','M12','M13','M14','M15','M16','M17','M18','M19','M20','M21','M22','M23','M24','M25','M26','M27'];
   const extra=cfg._modulos_extra||[];
-  const disabled=cfg._modulos_disabled||[];
+  let disabled=cfg._modulos_disabled||[];
   const renamed=cfg._modulos_renamed||{};
+  // Protección: si disabled tiene todos los módulos base, ignorarlo (estado corrupto)
+  const allBaseDisabled = base.every(id => disabled.includes(id));
+  if(allBaseDisabled){ disabled=[]; cfg._modulos_disabled=[]; }
   // Rebuild global MODULES
   MODULES.length=0;
   [...base,...extra].forEach(id=>{
