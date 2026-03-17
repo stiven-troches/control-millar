@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<!-- ═══════════════════════════════════════════════════════════════
+     Tablero_CI.html — Control de Insumos — Confecciones Millar v4.0
+     Archivo independiente accesible en GET /ci
+     Se comunica con el servidor vía WebSocket compartido.
+ ════════════════════════════════════════════════════════════════ -->
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Tablero CI — Confecciones Millar</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800&family=Nunito:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#f1f5f9;--panel:#fff;--border:#e2e8f0;
+  --green:#22c55e;--yellow:#eab308;--red:#ef4444;--blue:#2563eb;
+  --blue-dark:#1e3a8a;--teal:#0d9488;--orange:#f97316;
+  --text:#0f172a;--muted:#64748b;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);font-family:'Nunito',sans-serif;color:var(--text);min-height:100vh;overflow-x:hidden;}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(203,213,225,.4) 1px,transparent 1px),linear-gradient(90deg,rgba(203,213,225,.4) 1px,transparent 1px);background-size:28px 28px;pointer-events:none;z-index:0;}
+
+/* ── HEADER ── */
+header{position:relative;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:0 24px;background:linear-gradient(135deg,#020d22 0%,#04163d 50%,#0a2570 100%);box-shadow:0 2px 12px rgba(2,13,34,.3);min-height:60px;}
+header::after{content:'';position:absolute;bottom:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#1e3a8a,#2563eb,#60a5fa);}
+.hd-left{display:flex;align-items:center;gap:12px;}
+.hd-logo{width:34px;height:34px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;font-size:16px;box-shadow:0 0 0 2px rgba(255,255,255,.2);}
+h1{font-family:'Barlow Condensed',sans-serif;font-size:18px;font-weight:700;letter-spacing:4px;text-transform:uppercase;color:#fff;}
+.hd-right{display:flex;align-items:center;gap:10px;}
+.live-dot{width:9px;height:9px;border-radius:50%;background:rgba(255,255,255,.3);}
+.live-dot.online{background:var(--green);box-shadow:0 0 8px rgba(34,197,94,.8);animation:lp 2s infinite;}
+.live-dot.offline{background:var(--red);}
+@keyframes lp{0%,100%{box-shadow:0 0 5px rgba(34,197,94,.6);}50%{box-shadow:0 0 16px rgba(34,197,94,1);}}
+.btn-volver{padding:7px 16px;border-radius:8px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:rgba(255,255,255,.75);font-family:'Nunito',sans-serif;font-size:12px;font-weight:700;cursor:pointer;transition:all .2s;}
+.btn-volver:hover{background:rgba(255,255,255,.15);color:#fff;}
+.conn-label{font-size:10px;font-weight:700;letter-spacing:1.5px;color:rgba(255,255,255,.5);text-transform:uppercase;}
+
+/* ── MAIN ── */
+main{position:relative;z-index:1;padding:20px;max-width:1300px;margin:0 auto;}
+
+/* ── STATS BAR ── */
+.stats-bar{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px;}
+.stat-chip{display:flex;align-items:center;gap:8px;padding:10px 18px;background:#fff;border:1.5px solid var(--border);border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,.05);font-size:13px;font-weight:700;}
+.stat-chip .dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
+.stat-chip.pending .dot{background:var(--yellow);}
+.stat-chip.alert .dot{background:var(--red);animation:rb .85s infinite;}
+.stat-chip.done .dot{background:var(--green);}
+.stat-chip.total .dot{background:var(--blue);}
+@keyframes rb{0%,100%{box-shadow:0 0 4px rgba(239,68,68,.6);}50%{box-shadow:0 0 12px rgba(239,68,68,1);}}
+
+/* ── TOOLBAR ── */
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;align-items:center;}
+.search-input{flex:1;min-width:180px;padding:9px 14px;border-radius:9px;border:1.5px solid var(--border);background:#fff;font-family:'Nunito',sans-serif;font-size:13px;outline:none;transition:border-color .2s;}
+.search-input:focus{border-color:var(--blue);}
+.filter-select{padding:9px 12px;border-radius:9px;border:1.5px solid var(--border);background:#fff;font-family:'Nunito',sans-serif;font-size:13px;outline:none;cursor:pointer;}
+.btn-primary{padding:9px 20px;border-radius:9px;border:none;background:var(--blue);color:#fff;font-family:'Nunito',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:6px;}
+.btn-primary:hover{background:#1d4ed8;}
+.btn-danger{padding:9px 16px;border-radius:9px;border:1.5px solid rgba(239,68,68,.3);background:rgba(239,68,68,.06);color:#dc2626;font-family:'Nunito',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .2s;}
+.btn-danger:hover{background:rgba(239,68,68,.12);}
+
+/* ── CARDS GRID ── */
+.cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px;}
+.ci-card{background:#fff;border:1.5px solid var(--border);border-radius:14px;padding:16px;box-shadow:0 1px 6px rgba(0,0,0,.05);transition:box-shadow .2s;position:relative;overflow:hidden;}
+.ci-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:14px 14px 0 0;}
+.ci-card.status-pending::before{background:var(--yellow);}
+.ci-card.status-alert::before{background:var(--red);}
+.ci-card.status-done::before{background:var(--green);}
+.ci-card.status-alert{border-color:rgba(239,68,68,.3);background:rgba(239,68,68,.02);}
+.ci-card:hover{box-shadow:0 4px 16px rgba(0,0,0,.1);}
+
+.card-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;}
+.card-module{font-family:'Barlow Condensed',sans-serif;font-size:22px;font-weight:700;color:var(--blue-dark);}
+.card-status{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;padding:4px 10px;border-radius:20px;}
+.card-status.pending{background:rgba(234,179,8,.12);color:#78350f;}
+.card-status.alert{background:rgba(239,68,68,.12);color:#991b1b;animation:pulse-bg 1.5s infinite;}
+.card-status.done{background:rgba(34,197,94,.12);color:#14532d;}
+@keyframes pulse-bg{0%,100%{background:rgba(239,68,68,.12);}50%{background:rgba(239,68,68,.22);}}
+
+.card-insumo{font-size:15px;font-weight:700;color:var(--text);margin-bottom:6px;}
+.card-detail{font-size:12px;color:var(--muted);margin-bottom:4px;display:flex;gap:6px;align-items:center;}
+.card-detail strong{color:var(--text);}
+.card-obs{margin-top:8px;padding:8px 10px;background:#f8fafc;border-radius:8px;font-size:12px;color:var(--muted);border-left:3px solid var(--border);}
+.card-timer{font-family:'Courier New',monospace;font-size:13px;font-weight:700;color:var(--red);margin-top:8px;}
+.card-timer.ok{color:var(--muted);}
+
+.card-actions{display:flex;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid var(--border);}
+.card-btn{flex:1;padding:7px 0;border-radius:8px;border:1.5px solid var(--border);background:#fff;font-family:'Nunito',sans-serif;font-size:12px;font-weight:700;cursor:pointer;transition:all .2s;color:var(--muted);}
+.card-btn:hover{background:#f1f5f9;}
+.card-btn.cumplir{border-color:rgba(34,197,94,.3);color:#16a34a;}
+.card-btn.cumplir:hover{background:rgba(34,197,94,.08);}
+.card-btn.eliminar{border-color:rgba(239,68,68,.3);color:#dc2626;}
+.card-btn.eliminar:hover{background:rgba(239,68,68,.08);}
+
+/* ── EMPTY STATE ── */
+.empty-state{text-align:center;padding:60px 20px;color:var(--muted);}
+.empty-state .icon{font-size:48px;margin-bottom:12px;}
+.empty-state p{font-size:15px;font-weight:600;}
+.empty-state small{font-size:13px;}
+
+/* ── MODAL ── */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center;padding:20px;}
+.modal-overlay.open{display:flex;}
+.modal{background:#fff;border-radius:16px;padding:28px;width:100%;max-width:480px;box-shadow:0 20px 60px rgba(0,0,0,.2);max-height:90vh;overflow-y:auto;}
+.modal-title{font-family:'Barlow Condensed',sans-serif;font-size:22px;font-weight:700;color:var(--text);margin-bottom:20px;display:flex;align-items:center;gap:8px;}
+.form-group{margin-bottom:16px;}
+.form-label{display:block;font-size:12px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);margin-bottom:6px;}
+.form-control{width:100%;padding:10px 14px;border-radius:9px;border:1.5px solid var(--border);background:#fff;font-family:'Nunito',sans-serif;font-size:14px;color:var(--text);outline:none;transition:border-color .2s;}
+.form-control:focus{border-color:var(--blue);}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+.modal-actions{display:flex;gap:10px;margin-top:22px;}
+.modal-actions .btn-primary{flex:1;justify-content:center;}
+.btn-cancel{padding:10px 20px;border-radius:9px;border:1.5px solid var(--border);background:#fff;font-family:'Nunito',sans-serif;font-size:13px;font-weight:700;cursor:pointer;color:var(--muted);}
+.btn-cancel:hover{background:#f1f5f9;}
+
+/* ── FLUJO TALLA ── */
+.talla-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;}
+.talla-chip{padding:5px 12px;border-radius:20px;border:1.5px solid var(--border);background:#fff;font-size:12px;font-weight:700;cursor:pointer;transition:all .2s;}
+.talla-chip.selected{border-color:var(--blue);background:rgba(37,99,235,.08);color:var(--blue);}
+
+/* ── TOAST ── */
+#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;padding:12px 24px;border-radius:24px;font-size:13px;font-weight:700;z-index:9999;display:none;white-space:nowrap;box-shadow:0 4px 20px rgba(0,0,0,.3);}
+
+/* ── LOADER ── */
+#ci-loader{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:16px;color:var(--muted);}
+.ci-spin{width:40px;height:40px;border:3px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:spin .8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+
+<!-- Loader inicial -->
+<div id="ci-loader">
+  <div class="ci-spin"></div>
+  <span style="font-size:13px;letter-spacing:2px;text-transform:uppercase;">Conectando...</span>
+</div>
+
+<!-- App principal -->
+<div id="ci-app" style="display:none;">
+  <header>
+    <div class="hd-left">
+      <div class="hd-logo">📦</div>
+      <h1>Tablero <span style="color:#60a5fa;">CI</span></h1>
+    </div>
+    <div class="hd-right">
+      <span class="conn-label" id="ci-conn-label">CONECTANDO</span>
+      <div class="live-dot" id="ci-live-dot"></div>
+      <button class="btn-volver" onclick="window.location.href='/'">← Piso</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Stats -->
+    <div class="stats-bar" id="ci-stats"></div>
+
+    <!-- Toolbar -->
+    <div class="toolbar">
+      <input class="search-input" id="ci-search" placeholder="Buscar por módulo, insumo, operaria…" oninput="renderCards()">
+      <select class="filter-select" id="ci-filter-status" onchange="renderCards()">
+        <option value="">Todos los estados</option>
+        <option value="pending">⏳ Pendiente</option>
+        <option value="alert">🔴 Alerta</option>
+        <option value="done">✅ Cumplido</option>
+      </select>
+      <select class="filter-select" id="ci-filter-insumo" onchange="renderCards()">
+        <option value="">Todos los insumos</option>
+      </select>
+      <button class="btn-primary" onclick="openNuevaSolicitud()">+ Nueva Solicitud</button>
+    </div>
+
+    <!-- Cards -->
+    <div class="cards-grid" id="ci-cards"></div>
+  </main>
+</div>
+
+<!-- Modal nueva solicitud -->
+<div class="modal-overlay" id="modal-nueva">
+  <div class="modal">
+    <div class="modal-title">📦 Nueva Solicitud de Insumo</div>
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Módulo *</label>
+        <select class="form-control" id="f-modulo"></select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Insumo *</label>
+        <select class="form-control" id="f-insumo" onchange="onInsumoChange()"></select>
+      </div>
+    </div>
+
+    <!-- Flujo qty_only -->
+    <div id="flow-qty" style="display:none;">
+      <div class="form-group">
+        <label class="form-label">Cantidad *</label>
+        <input class="form-control" type="number" id="f-qty" min="1" placeholder="Ej: 100">
+      </div>
+    </div>
+
+    <!-- Flujo elastico -->
+    <div id="flow-elastico" style="display:none;">
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Tipo Elástico *</label>
+          <select class="form-control" id="f-elastico-tipo"></select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Cantidad *</label>
+          <input class="form-control" type="number" id="f-elastico-qty" min="1" placeholder="Ej: 50">
+        </div>
+      </div>
+    </div>
+
+    <!-- Flujo qty_talla -->
+    <div id="flow-talla" style="display:none;">
+      <div class="form-group">
+        <label class="form-label">Cantidad *</label>
+        <input class="form-control" type="number" id="f-talla-qty" min="1" placeholder="Ej: 200">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Tallas *</label>
+        <div class="talla-chips" id="f-tallas-container"></div>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Operaria / Observación</label>
+      <input class="form-control" id="f-obs" placeholder="Nombre operaria o detalle adicional">
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeModal('modal-nueva')">Cancelar</button>
+      <button class="btn-primary" onclick="submitSolicitud()">📤 Enviar Solicitud</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+'use strict';
+// ════════════════════════════════════════════════════════
+//  Tablero_CI.html — Control de Insumos v4.0
+//  WebSocket directo al servidor
+// ════════════════════════════════════════════════════════
+
+let ws, wsReady = false, reconnectDelay = 1000, reconnectTimer = null;
+let requests = [];
+let tipoInsumoList = [], elasticoList = [], moduleList = [], obsList = [];
+
+const TALLAS = ['2T','4T','6T','8T','10','12','14','XS','S','M','L','XL','XXL','6M','9M','12M','18M','24M'];
+
+// ── WS ────────────────────────────────────────────────
+function connectWS(){
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}`);
+
+  ws.onopen = () => {
+    wsReady = true;
+    reconnectDelay = 1000;
+    setConn(true);
+    ws.send(JSON.stringify({ type: 'ci_init' }));
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'ci_init' || msg.type === 'ci_full_sync') {
+        requests       = msg.requests       || [];
+        tipoInsumoList = msg.tipoInsumoList || tipoInsumoList;
+        elasticoList   = msg.elasticoList   || elasticoList;
+        moduleList     = msg.moduleList     || moduleList;
+        obsList        = msg.obsList        || obsList;
+        populateFilters();
+        renderCards();
+        showApp();
+      } else if (msg.type === 'ci_new_request') {
+        if (!requests.find(r => r._id === msg.request._id)) requests.unshift(msg.request);
+        renderCards();
+        toast('📦 Nueva solicitud de ' + msg.request.tipoInsumo);
+      } else if (msg.type === 'ci_update_request') {
+        const idx = requests.findIndex(r => r._id === msg.request._id);
+        if (idx > -1) requests[idx] = msg.request;
+        else requests.unshift(msg.request);
+        renderCards();
+      } else if (msg.type === 'ci_delete_request') {
+        requests = requests.filter(r => r._id !== msg.reqId);
+        renderCards();
+      } else if (msg.type === 'ci_cumplido_request') {
+        if (msg.request) {
+          const idx = requests.findIndex(r => r._id === msg.request._id);
+          if (idx > -1) requests[idx] = { ...requests[idx], status: 'done' };
+          renderCards();
+        }
+      } else if (msg.type === 'ci_config_sync') {
+        if (msg.tipoInsumoList) tipoInsumoList = msg.tipoInsumoList;
+        if (msg.elasticoList)   elasticoList   = msg.elasticoList;
+        if (msg.moduleList)     moduleList     = msg.moduleList;
+        populateFilters();
+        renderCards();
+      } else if (msg.type === 'server_reset') {
+        alert('⚠️ El servidor fue reseteado. La página se recargará.');
+        location.reload();
+      }
+    } catch(err) { console.error('CI WS error:', err); }
+  };
+
+  ws.onclose = () => {
+    wsReady = false;
+    setConn(false);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+      connectWS();
+    }, reconnectDelay);
+  };
+  ws.onerror = () => ws.close();
+}
+
+function wsSend(obj) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+function setConn(online) {
+  const dot   = document.getElementById('ci-live-dot');
+  const label = document.getElementById('ci-conn-label');
+  if (online) {
+    dot.className = 'live-dot online';
+    label.textContent = 'EN LÍNEA';
+  } else {
+    dot.className = 'live-dot offline';
+    label.textContent = 'RECONECTANDO';
+  }
+}
+
+function showApp() {
+  document.getElementById('ci-loader').style.display = 'none';
+  document.getElementById('ci-app').style.display    = 'block';
+}
+
+// ── Timers ────────────────────────────────────────────
+function formatTimer(alertStart) {
+  if (!alertStart) return '';
+  const diff = Math.floor((Date.now() - alertStart) / 1000);
+  if (diff < 60)  return diff + 's';
+  if (diff < 3600) return Math.floor(diff/60) + 'm ' + (diff%60) + 's';
+  return Math.floor(diff/3600) + 'h ' + Math.floor((diff%3600)/60) + 'm';
+}
+
+// actualizar timers cada segundo
+setInterval(() => {
+  document.querySelectorAll('[data-timer]').forEach(el => {
+    const ts = parseInt(el.dataset.timer);
+    if (!ts) return;
+    const diff = Math.floor((Date.now() - ts) / 1000);
+    el.textContent = '⏱ ' + formatTimer(ts);
+    el.className   = 'card-timer' + (diff > 600 ? '' : ' ok');
+  });
+}, 1000);
+
+// ── Filtros y render ──────────────────────────────────
+function populateFilters() {
+  const sel = document.getElementById('ci-filter-insumo');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">Todos los insumos</option>';
+  tipoInsumoList.forEach(t => {
+    const o = document.createElement('option');
+    o.value = t.name; o.textContent = t.name;
+    if (t.name === cur) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+function getFiltered() {
+  const q      = (document.getElementById('ci-search').value || '').toLowerCase();
+  const status = document.getElementById('ci-filter-status').value;
+  const insumo = document.getElementById('ci-filter-insumo').value;
+  return requests.filter(r => {
+    if (status && r.status !== status) return false;
+    if (insumo && r.tipoInsumo !== insumo) return false;
+    if (q) {
+      const hay = [r.modulo, r.tipoInsumo, r.obs, r.tipoElastico, r.tallas?.join(' ')].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+function renderStats() {
+  const pending = requests.filter(r => r.status === 'pending').length;
+  const alert   = requests.filter(r => r.status === 'alert').length;
+  const done    = requests.filter(r => r.status === 'done').length;
+  document.getElementById('ci-stats').innerHTML = `
+    <div class="stat-chip total"><div class="dot" style="background:var(--blue)"></div> ${requests.length} Total</div>
+    <div class="stat-chip pending"><div class="dot"></div> ${pending} Pendiente${pending!==1?'s':''}</div>
+    <div class="stat-chip alert"><div class="dot"></div> ${alert} Alerta${alert!==1?'s':''}</div>
+    <div class="stat-chip done"><div class="dot"></div> ${done} Cumplido${done!==1?'s':''}</div>
+  `;
+}
+
+function statusLabel(s) {
+  if (s === 'pending') return '<span class="card-status pending">⏳ Pendiente</span>';
+  if (s === 'alert')   return '<span class="card-status alert">🔴 Alerta</span>';
+  if (s === 'done')    return '<span class="card-status done">✅ Cumplido</span>';
+  return `<span class="card-status pending">${s}</span>`;
+}
+
+function renderCards() {
+  renderStats();
+  const filtered = getFiltered();
+  const container = document.getElementById('ci-cards');
+  if (!filtered.length) {
+    container.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">
+      <div class="icon">📭</div>
+      <p>No hay solicitudes</p>
+      <small>Usa el botón "+ Nueva Solicitud" para crear una</small>
+    </div>`;
+    return;
+  }
+
+  container.innerHTML = filtered.map(r => {
+    const isDone  = r.status === 'done';
+    const details = buildDetails(r);
+    const timerHtml = (!isDone && r.alertStart)
+      ? `<div class="card-timer" data-timer="${r.alertStart}">⏱ ${formatTimer(r.alertStart)}</div>` : '';
+    const obsHtml = r.obs ? `<div class="card-obs">💬 ${escHtml(r.obs)}</div>` : '';
+
+    return `<div class="ci-card status-${r.status||'pending'}">
+      <div class="card-top">
+        <div class="card-module">${escHtml(r.modulo||'—')}</div>
+        ${statusLabel(r.status)}
+      </div>
+      <div class="card-insumo">${escHtml(r.tipoInsumo||'—')}</div>
+      ${details}
+      ${obsHtml}
+      ${timerHtml}
+      <div class="card-actions">
+        ${!isDone ? `<button class="card-btn cumplir" onclick="cumplir('${r._id}')">✅ Cumplir</button>` : ''}
+        <button class="card-btn eliminar" onclick="eliminar('${r._id}')">🗑 Eliminar</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function buildDetails(r) {
+  const rows = [];
+  if (r.cantidad)     rows.push(`<div class="card-detail">📦 <strong>${r.cantidad}</strong> unidades</div>`);
+  if (r.tipoElastico) rows.push(`<div class="card-detail">🔗 Elástico: <strong>${escHtml(r.tipoElastico)}</strong></div>`);
+  if (r.tallas?.length) rows.push(`<div class="card-detail">📐 Tallas: <strong>${r.tallas.join(' · ')}</strong></div>`);
+  const ts = r.alertStart ? new Date(r.alertStart).toLocaleTimeString('es-CO',{hour:'2-digit',minute:'2-digit'}) : '';
+  if (ts) rows.push(`<div class="card-detail">🕐 <strong>${ts}</strong></div>`);
+  return rows.join('');
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Acciones ──────────────────────────────────────────
+function cumplir(id) {
+  const req = requests.find(r => r._id === id);
+  if (!req) return;
+  if (!confirm(`¿Marcar como cumplida la solicitud de ${req.tipoInsumo} para ${req.modulo}?`)) return;
+  req.status = 'done';
+  wsSend({ type: 'ci_update_request', request: req });
+  wsSend({ type: 'ci_cumplido_request', request: req });
+  renderCards();
+  toast('✅ Solicitud marcada como cumplida');
+}
+
+function eliminar(id) {
+  if (!confirm('¿Eliminar esta solicitud?')) return;
+  requests = requests.filter(r => r._id !== id);
+  wsSend({ type: 'ci_delete_request', reqId: id });
+  renderCards();
+  toast('🗑 Solicitud eliminada');
+}
+
+// ── Modal nueva solicitud ─────────────────────────────
+function openNuevaSolicitud() {
+  // Poblar selects
+  const selMod = document.getElementById('f-modulo');
+  selMod.innerHTML = moduleList.map(m => `<option value="${m}">${m}</option>`).join('');
+
+  const selIns = document.getElementById('f-insumo');
+  selIns.innerHTML = tipoInsumoList.map(t => `<option value="${t.name}" data-flow="${t.flow}">${t.name}</option>`).join('');
+
+  // Poblar tipos de elástico
+  const selEl = document.getElementById('f-elastico-tipo');
+  selEl.innerHTML = elasticoList.map(e => `<option value="${e}">${e}</option>`).join('');
+
+  // Poblar tallas
+  const tCont = document.getElementById('f-tallas-container');
+  tCont.innerHTML = TALLAS.map(t =>
+    `<div class="talla-chip" data-talla="${t}" onclick="toggleTalla(this)">${t}</div>`
+  ).join('');
+
+  // Limpiar campos
+  document.getElementById('f-qty').value        = '';
+  document.getElementById('f-elastico-qty').value = '';
+  document.getElementById('f-talla-qty').value   = '';
+  document.getElementById('f-obs').value         = '';
+
+  onInsumoChange();
+  document.getElementById('modal-nueva').classList.add('open');
+}
+
+function onInsumoChange() {
+  const sel  = document.getElementById('f-insumo');
+  const opt  = sel.options[sel.selectedIndex];
+  const flow = opt ? opt.dataset.flow : 'qty_only';
+  document.getElementById('flow-qty').style.display      = flow === 'qty_only'  ? '' : 'none';
+  document.getElementById('flow-elastico').style.display = flow === 'elastico'  ? '' : 'none';
+  document.getElementById('flow-talla').style.display    = flow === 'qty_talla' ? '' : 'none';
+}
+
+function toggleTalla(el) {
+  el.classList.toggle('selected');
+}
+
+function submitSolicitud() {
+  const modulo    = document.getElementById('f-modulo').value;
+  const insumoSel = document.getElementById('f-insumo');
+  const tipoInsumo = insumoSel.value;
+  const flow = insumoSel.options[insumoSel.selectedIndex]?.dataset?.flow || 'qty_only';
+  const obs   = document.getElementById('f-obs').value.trim();
+
+  if (!modulo || !tipoInsumo) { alert('Selecciona módulo e insumo.'); return; }
+
+  const req = {
+    _id:        `${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+    modulo,
+    tipoInsumo,
+    obs,
+    status:     'pending',
+    alertStart: Date.now()
+  };
+
+  if (flow === 'qty_only') {
+    const qty = parseInt(document.getElementById('f-qty').value);
+    if (!qty || qty < 1) { alert('Ingresa una cantidad válida.'); return; }
+    req.cantidad = qty;
+  } else if (flow === 'elastico') {
+    const tipo = document.getElementById('f-elastico-tipo').value;
+    const qty  = parseInt(document.getElementById('f-elastico-qty').value);
+    if (!tipo || !qty || qty < 1) { alert('Selecciona tipo y cantidad de elástico.'); return; }
+    req.tipoElastico = tipo;
+    req.cantidad     = qty;
+  } else if (flow === 'qty_talla') {
+    const qty    = parseInt(document.getElementById('f-talla-qty').value);
+    const tallas = [...document.querySelectorAll('.talla-chip.selected')].map(c => c.dataset.talla);
+    if (!qty || qty < 1)   { alert('Ingresa una cantidad válida.'); return; }
+    if (!tallas.length)    { alert('Selecciona al menos una talla.'); return; }
+    req.cantidad = qty;
+    req.tallas   = tallas;
+  }
+
+  requests.unshift(req);
+  wsSend({ type: 'ci_new_request', request: req });
+  closeModal('modal-nueva');
+  renderCards();
+  toast('📤 Solicitud enviada: ' + tipoInsumo + ' → ' + modulo);
+}
+
+function closeModal(id) {
+  document.getElementById(id).classList.remove('open');
+}
+
+// ── Toast ─────────────────────────────────────────────
+let toastTimer;
+function toast(msg, ms = 2800) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.display = 'none'; }, ms);
+}
+
+// ── Cerrar modal al click fuera ───────────────────────
+document.getElementById('modal-nueva').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeModal('modal-nueva');
+});
+
+// ── Iniciar ───────────────────────────────────────────
+connectWS();
+</script>
+</body>
+</html>
