@@ -119,7 +119,12 @@ function connectWS(){
           _appConfig._modulos_pass     = msg.modulesConfig.modPass  || {};
           rebuildModules();
         }
-        arrancarApp();
+        // Si la app ya arrancó (login visible), actualizar el select con datos reales
+        if(_appArranged){
+          if(typeof iaBuildLoginSelect==='function') iaBuildLoginSelect();
+        } else {
+          arrancarApp();
+        }
 
       } else if(msg.type === 'ia_add_record'){
         if(!iaRecords) iaRecords=[];
@@ -199,19 +204,11 @@ function getProfileMembers(perfil){
   return (_appConfig._perfil_members && _appConfig._perfil_members[perfil]) || [];
 }
 
-// ── Timeout de seguridad: arrancar igual si el WS tarda ──
+// ── Arrancar inmediatamente sin esperar WS ──────────────────────
+// El WS sincronizará datos en background cuando conecte.
+// Así no queda trabado si Render está durmiendo.
 let _appArranged = false;
-// 3s: si el servidor no responde (ej. Render durmiendo), mostrar login igual
-setTimeout(()=>{
-  if(!_appArranged){
-    dbg('TIMEOUT — arrancando sin WS');
-    if(!iaState) iaState = { supervisors:[], employees:[] };
-    // Actualizar mensaje antes de arrancar
-    const lm = document.getElementById('ia-loader-msg');
-    if(lm) lm.textContent = 'Iniciando...';
-    arrancarApp();
-  }
-}, 3000);
+if(!iaState) iaState = { supervisors:[], employees:[] };
 
 // ── arrancarApp: inyectar HTML + ejecutar lógica ─────
 function arrancarApp(){
@@ -249,9 +246,10 @@ async function loadConfigFromServer(){
   } catch(e){ console.warn('No se pudo cargar app-config:', e.message); }
 }
 
-// ── Init — WS se conecta de inmediato, config en paralelo ────
-connectWS();
-loadConfigFromServer(); // no bloquea — se aplica cuando llega
+// ── Init — cargar config y arrancar inmediatamente ──────────────
+loadConfigFromServer(); // no bloquea
+connectWS();            // WS sincroniza datos en background
+arrancarApp();          // mostrar login de inmediato sin esperar WS
 
 // ════════════════════════════════════════════════════════
 //  HTML del Control de Asistencia
