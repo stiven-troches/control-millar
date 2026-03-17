@@ -1015,9 +1015,7 @@ MODULES.forEach(id=>{ states[id]='green'; timers[id]=Date.now(); lastMec[id]='';
 // ── Variables de estado global del tablero ─────────────────────────
 let selectedMod=null, activeFilters=new Set(), currentView=null, pendingTransicion=null, currentUser=null;
 // Módulos ocultos por el usuario (persiste en localStorage)
-let hiddenMods=new Set(JSON.parse(localStorage.getItem('hiddenMods')||'[]'));
-// Si todos los módulos están ocultos (estado inválido), resetear visibilidad
-if(hiddenMods.size >= MODULES.length){ hiddenMods.clear(); localStorage.removeItem('hiddenMods'); }
+const hiddenMods=new Set(); localStorage.removeItem('hiddenMods'); // visibilidad siempre completa
 // ── Helpers de permisos ─────────────────────────────────────────────
 function hasPerm(p){ return currentUser&&USUARIOS[currentUser]&&USUARIOS[currentUser].perms.includes(p); }
 function isProg(){ return hasPerm('fix')&&hasPerm('modulos')&&hasPerm('tablero'); }
@@ -1967,24 +1965,12 @@ function renderGrid(){
     const sVis=esPlanta&&s==='orange'?'green':s;
     const mecHtml=(sVis==='yellow'||sVis==='red')&&lastMec[id]?`<span class="mod-mec">🔧 ${lastMec[id]}</span>`:`<span class="mod-mec"></span>`;
     div.className=`module ${canClick?'clickable':'readonly'} ${sVis}${hiddenMods.has(id)?' mod-hidden-card':''}`;
-    div.innerHTML=`<button class="mod-hide-btn" title="Ocultar/mostrar módulo" onclick="toggleHideModule('${id}',event)">👁</button><span class="mod-id">${id}</span><div class="light"></div><span class="mod-label">${LABELS[sVis]}</span><span class="mod-timer" id="timer-${id}"></span>${mecHtml}`;
+    div.innerHTML=`<span class="mod-id">${id}</span><div class="light"></div><span class="mod-label">${LABELS[sVis]}</span><span class="mod-timer" id="timer-${id}"></span>${mecHtml}`;
     // Filtro por estado (hidden-filter oculta la card en el layout)
     const filtrado=activeFilters.size>0&&!activeFilters.has(sVis);
     div.classList.toggle('hidden-filter', filtrado);
     if(!filtrado&&!hiddenMods.has(id)) anyVisible=true;
   });
-  // Si no hay nada visible y es por hiddenMods (no por filtro activo), resetear
-  if(!anyVisible && hiddenMods.size > 0 && activeFilters.size === 0){
-    hiddenMods.clear();
-    localStorage.removeItem('hiddenMods');
-    // Re-renderizar con todos visibles
-    MODULES.forEach(id=>{
-      const div=document.getElementById('mod-'+id);
-      if(div) div.classList.remove('mod-hidden-card');
-    });
-    renderGrid();
-    return;
-  }
   // Mensaje vacío
   let emptyMsg=grid.querySelector('.empty-msg');
   if(!anyVisible){
