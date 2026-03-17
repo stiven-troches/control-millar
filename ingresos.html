@@ -201,13 +201,17 @@ function getProfileMembers(perfil){
 
 // ── Timeout de seguridad: arrancar igual si el WS tarda ──
 let _appArranged = false;
+// 3s: si el servidor no responde (ej. Render durmiendo), mostrar login igual
 setTimeout(()=>{
   if(!_appArranged){
     dbg('TIMEOUT — arrancando sin WS');
     if(!iaState) iaState = { supervisors:[], employees:[] };
+    // Actualizar mensaje antes de arrancar
+    const lm = document.getElementById('ia-loader-msg');
+    if(lm) lm.textContent = 'Iniciando...';
     arrancarApp();
   }
-}, 8000);
+}, 3000);
 
 // ── arrancarApp: inyectar HTML + ejecutar lógica ─────
 function arrancarApp(){
