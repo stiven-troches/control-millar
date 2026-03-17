@@ -629,7 +629,7 @@ select.sp-ctrl{background-color:#fff;
     <button class="btn-bar green"  id="btn-excel-bar" style="display:none;" onclick="openExcelModal()">📥 Excel</button>
     <button class="btn-bar yellow" id="btn-fix-mec"   style="display:none;" onclick="openFixMecModal()">🔧 Corregir</button>
     <button class="btn-bar purple" onclick="openAcumuladoModal()">📊 Acumulado</button>
-    <button class="btn-bar"        onclick="openHideModPanel()" title="Mostrar/ocultar módulos">👁 Mostrar</button>
+
   </div>
 </div>
 
@@ -1973,6 +1973,18 @@ function renderGrid(){
     div.classList.toggle('hidden-filter', filtrado);
     if(!filtrado&&!hiddenMods.has(id)) anyVisible=true;
   });
+  // Si no hay nada visible y es por hiddenMods (no por filtro activo), resetear
+  if(!anyVisible && hiddenMods.size > 0 && activeFilters.size === 0){
+    hiddenMods.clear();
+    localStorage.removeItem('hiddenMods');
+    // Re-renderizar con todos visibles
+    MODULES.forEach(id=>{
+      const div=document.getElementById('mod-'+id);
+      if(div) div.classList.remove('mod-hidden-card');
+    });
+    renderGrid();
+    return;
+  }
   // Mensaje vacío
   let emptyMsg=grid.querySelector('.empty-msg');
   if(!anyVisible){
@@ -2617,6 +2629,12 @@ function rebuildModules(){
   [...base,...extra].forEach(id=>{
     if(!disabled.includes(id)) MODULES.push(renamed[id]||id);
   });
+  // Protección: si quedaron 0 módulos (disabled corrupto), restaurar base completa
+  if(MODULES.length === 0){
+    base.forEach(id=>{ MODULES.push(renamed[id]||id); });
+    cfg._modulos_disabled = [];
+    console.warn('rebuildModules: disabled tenía todos los módulos — restaurado a base completa');
+  }
   // Init states for new modules
   MODULES.forEach(id=>{ if(states[id]===undefined){states[id]='green';timers[id]=Date.now();lastMec[id]='';acumRed[id]=0;acumYellow[id]=0;acumBlue[id]=0;acumOrange[id]=0;} });
   // Refrescar selector modulo-sel si existe
