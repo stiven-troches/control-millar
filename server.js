@@ -283,11 +283,14 @@ app.get('/alistamiento', (req, res) =>
 );
 
 const CI_PATH = path.join(__dirname, 'Tablero_CI.html');
-if (!fs.existsSync(CI_PATH)) {
-  console.warn('⚠️  Tablero_CI.html no encontrado — la ruta /ci devolverá 404');
-}
+console.log('CI_PATH:', CI_PATH, '| exists:', fs.existsSync(CI_PATH));
+console.log('__dirname:', __dirname);
+console.log('Files in __dirname:', fs.readdirSync(__dirname).join(', '));
 app.get('/ci', (req, res) => {
-  if (!fs.existsSync(CI_PATH)) return res.status(404).send('Tablero CI no encontrado');
+  if (!fs.existsSync(CI_PATH)) {
+    console.error('Tablero_CI.html no encontrado en:', CI_PATH);
+    return res.status(404).send('Tablero CI no encontrado. CI_PATH: ' + CI_PATH);
+  }
   res.sendFile(CI_PATH);
 });
 
