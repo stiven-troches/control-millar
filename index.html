@@ -641,7 +641,7 @@ select.sp-ctrl{background-color:#fff;
 
 <!-- §2.2 · MAIN — Contenedor del tablero (grid) y vista individual -->
 <main>
-  <div id="grid-view" class="hidden"><div class="grid" id="grid"></div></div>
+  <div id="grid-view" style="display:none;"><div class="grid" id="grid"></div></div>
   <div id="single-view"><div id="big-container"></div></div>
 </main>
 <div id="vista-edit-banner">
@@ -1695,7 +1695,7 @@ function ocultarTodo(){
   ['area-screen','modulo-login-screen','modtable-screen'].forEach(id=>document.getElementById(id).classList.add('hidden'));
   document.getElementById('stats-bar').style.display='none';
   document.getElementById('nav-single').style.display='none';
-  document.getElementById('grid-view').classList.add('hidden');
+  document.getElementById('grid-view').style.display='none';
   document.getElementById('single-view').classList.remove('active');
   currentView=null;
 }
@@ -1783,16 +1783,19 @@ function atrasDesdeModulo(){
 // ── Navegación entre vistas (grid / single) ──────────────────────────
 function setView(v){
   currentView=v;
-  document.getElementById('grid-view').classList.toggle('hidden',v==='single');
-  document.getElementById('single-view').classList.toggle('active',v==='single');
-  document.getElementById('stats-bar').style.display  =v==='grid'  ?'flex':'none';
-  document.getElementById('nav-single').style.display =v==='single'?'flex':'none';
+  // Usar style directo — evitar conflictos con classList.hidden
+  const gv = document.getElementById('grid-view');
+  const sv = document.getElementById('single-view');
+  gv.style.display = (v==='grid') ? 'block' : 'none';
+  if(sv) sv.classList.toggle('active', v==='single');
+  document.getElementById('stats-bar').style.display   = v==='grid'   ? 'flex' : 'none';
+  document.getElementById('nav-single').style.display  = v==='single' ? 'flex' : 'none';
   if(v==='grid'){
-    document.getElementById('btn-excel-bar').style.display  =hasPerm('excel')?'':'none';
-    document.getElementById('btn-fix-mec').style.display    =hasPerm('fix')  ?'':'none';
-    document.getElementById('btn-cambiar-user').style.display=isProg()       ?'':'none';
+    const eb=document.getElementById('btn-excel-bar'); if(eb) eb.style.display=hasPerm('excel')?'':'none';
+    const fb=document.getElementById('btn-fix-mec');   if(fb) fb.style.display=hasPerm('fix')  ?'':'none';
+    const cb=document.getElementById('btn-cambiar-user'); if(cb) cb.style.display=isProg()?'':'none';
+    renderGrid();
   }
-  if(v==='grid')   renderGrid();
   if(v==='single') renderBig();
 }
 
@@ -1926,15 +1929,19 @@ function toggleFilter(color){
 // ── Aplicar filtro de estado sin reconstruir el DOM ──────────────────
 function applyGridFilter(){
   const esPlanta=(currentUser==='Mecanicos'||currentUser==='Televisor');
+  const BASE=['M01','M02','M03','M04','M05','M06','M07','M08','M09','M10',
+              'M11','M12','M13','M14','M15','M16','M17','M18','M19','M20',
+              'M21','M22','M23','M24','M25','M26','M27'];
+  const modList = MODULES.length > 0 ? MODULES : BASE;
   let anyVisible=false;
-  MODULES.forEach(id=>{
+  modList.forEach(id=>{
     const div=document.getElementById('mod-'+id);
     if(!div) return;
     const s=states[id]||'green';
     const sVis=esPlanta&&s==='orange'?'green':s;
     const filtrado=activeFilters.size>0&&!activeFilters.has(sVis);
     div.classList.toggle('hidden-filter', filtrado);
-    if(!filtrado&&!hiddenMods.has(id)) anyVisible=true;
+    if(!filtrado) anyVisible=true;
   });
   const grid=document.getElementById('grid');
   if(!grid) return;
@@ -1948,33 +1955,37 @@ function renderGrid(){
   const grid=document.getElementById('grid');
   const esPlanta=(currentUser==='Mecanicos'||currentUser==='Televisor');
   const canClick=hasPerm('fix');
-  // Reconstruir si cambió MODULES, cambió canClick, o el grid está vacío
+  // Usar siempre los 27 módulos base — ignorar MODULES por si está corrupto
+  const BASE=['M01','M02','M03','M04','M05','M06','M07','M08','M09','M10',
+              'M11','M12','M13','M14','M15','M16','M17','M18','M19','M20',
+              'M21','M22','M23','M24','M25','M26','M27'];
+  const modList = MODULES.length > 0 ? MODULES : BASE;
+  // Reconstruir si cambió la lista, cambió canClick, o el grid está vacío
   const gridEmpty = !grid.querySelector('[id^="mod-"]');
-  if(grid._builtFor!==MODULES.join(',')||grid._canClick!==canClick||gridEmpty){
+  if(grid._builtFor!==modList.join(',')||grid._canClick!==canClick||gridEmpty){
     grid.innerHTML='';
-    MODULES.forEach(id=>{
+    modList.forEach(id=>{
       const div=document.createElement('div');
       div.id=`mod-${id}`;
       if(canClick) div.addEventListener('click',e=>{if(document.body.classList.contains('vista-edit'))return;addRipple(div,e);applyChange(id);});
       grid.appendChild(div);
     });
-    grid._builtFor=MODULES.join(',');
+    grid._builtFor=modList.join(',');
     grid._canClick=canClick;
   }
   // Actualizar cada card (estado, clases, contenido)
   let anyVisible=false;
-  MODULES.forEach(id=>{
+  modList.forEach(id=>{
     const div=document.getElementById('mod-'+id);
     if(!div) return;
     const s=states[id]||'green';
     const sVis=esPlanta&&s==='orange'?'green':s;
     const mecHtml=(sVis==='yellow'||sVis==='red')&&lastMec[id]?`<span class="mod-mec">🔧 ${lastMec[id]}</span>`:`<span class="mod-mec"></span>`;
-    div.className=`module ${canClick?'clickable':'readonly'} ${sVis}${hiddenMods.has(id)?' mod-hidden-card':''}`;
+    div.className=`module ${canClick?'clickable':'readonly'} ${sVis}`;
     div.innerHTML=`<span class="mod-id">${id}</span><div class="light"></div><span class="mod-label">${LABELS[sVis]}</span><span class="mod-timer" id="timer-${id}"></span>${mecHtml}`;
-    // Filtro por estado (hidden-filter oculta la card en el layout)
     const filtrado=activeFilters.size>0&&!activeFilters.has(sVis);
     div.classList.toggle('hidden-filter', filtrado);
-    if(!filtrado&&!hiddenMods.has(id)) anyVisible=true;
+    if(!filtrado) anyVisible=true;
   });
   // Mensaje vacío
   let emptyMsg=grid.querySelector('.empty-msg');
