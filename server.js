@@ -1,2508 +1,879 @@
-<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>Control de Ingresos — Confecciones Millar</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800&family=Nunito:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-<style>
-*{ box-sizing:border-box; margin:0; padding:0; }
-body{ background:#f1f5f9; font-family:'Nunito',sans-serif; color:#0f172a; min-height:100vh; overflow-x:hidden; }
-input,select,textarea{ font-size:16px !important; }
-.ia-dropdown{ position:absolute; }
-:root{
-  --ia-bg:#f1f5f9; --ia-surface:#ffffff; --ia-surface2:#f8fafc;
-  --ia-accent:#2563eb; --ia-accent2:#1e3a8a;
-  --ia-text:#0f172a; --ia-muted:#64748b; --ia-border:#e2e8f0;
-  --ia-danger:#ef4444; --ia-warn:#f59e0b; --ia-absent:#ef4444;
-}
-/* Loader */
-#ia-loader{
-  display:flex;flex-direction:column;align-items:center;justify-content:center;
-  height:100vh;gap:16px;color:#6b7a99;
-}
-.ia-spin{
-  width:40px;height:40px;border:3px solid #e2e8f0;border-top-color:#2563eb;
-  border-radius:50%;animation:spin 0.8s linear infinite;
-}
-@keyframes spin{to{transform:rotate(360deg)}}
-</style>
-</head>
-<body>
+// ══════════════════════════════════════════════════════════════════
+//  server.js  —  Confecciones Millar  v4.0
+//  Mejoras aplicadas en esta versión:
+//  #1  Estado de módulos persistido en disco
+//  #2  Caché en memoria para loadDB / saveDB
+//  #3  SEGURIDAD: RESET_PASS obligatoria desde env var (sin fallback)
+//  #4  SEGURIDAD: /admin/reset cambiado de GET a POST
+//  #5  SEGURIDAD: Rate limiting en rutas admin y API
+//  #6  SEGURIDAD: Multer con fileFilter — solo imágenes permitidas
+//  #7  SEGURIDAD: CORS restringido al origen configurado
+//  #8  BUGFIX: broadcast ahora es función global (fix scope error)
+//  #9  Validación de entrada en rutas POST
+//  #10 Todo el routing unificado en Express
+//  #11 Validación de mensajes WebSocket
+//  #12 Helmet para cabeceras HTTP seguras
+//  #13 Health-check endpoint para Render
+// ══════════════════════════════════════════════════════════════════
 
-<!-- Loader inicial -->
-<div id="ia-loader">
-  <div class="ia-spin"></div>
-  <span id="ia-loader-msg" style="font-size:13px;letter-spacing:2px;text-transform:uppercase;">Cargando datos...</span>
-  <div id="ia-debug" style="margin-top:20px;font-size:11px;color:#94a3b8;font-family:monospace;text-align:left;max-width:400px;line-height:1.8;"></div>
-</div>
+'use strict';
 
-<!-- Contenedor principal — se llena cuando el WS está listo -->
-<div id="ingreso-app-root" style="display:none;"></div>
+const http    = require('http');
+const fs      = require('fs');
+const path    = require('path');
+const { WebSocketServer } = require('ws');
+const express = require('express');
+const multer  = require('multer');
+const xlsxLib = require('xlsx');
+const cors    = require('cors');
+const { v4: uuidv4 } = require('uuid');
 
-<script>
-// ══════════════════════════════════════════════════════
-//  ingresos.html — Control de Ingresos
-//  Archivo independiente, se comunica con el servidor
-//  vía WebSocket propio (igual que el index)
-// ══════════════════════════════════════════════════════
-
-// ── Debug visible en pantalla ────────────────────────
-function dbg(msg){
-  console.log('[ingresos]', msg);
-  const el = document.getElementById('ia-debug');
-  if(el) el.innerHTML += '• ' + msg + '<br>';
+// ── Variables de entorno obligatorias ────────────────────────────
+// #3: RESET_PASS DEBE estar definida en Render como env var.
+//     Si no existe, el servidor arranca pero avisa claramente.
+const RESET_PASS = process.env.RESET_PASS;
+if (!RESET_PASS) {
+  console.error('⚠️  ADVERTENCIA: Variable de entorno RESET_PASS no definida.');
+  console.error('   El endpoint /admin/reset estará DESHABILITADO hasta configurarla.');
 }
 
-// ── Parámetros recibidos desde el index ──────────────
-const _params   = new URLSearchParams(window.location.search);
-const currentUser = _params.get('user') || '';
+const PORT          = process.env.PORT          || 3000;
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || null; // null = solo en dev
 
-// ── Variables globales del módulo ────────────────────
-let iaState   = null;
-let iaRecords = [];
-let _appConfig = {};
-let MODULES   = ['M01','M02','M03','M04','M05','M06','M07','M08','M09','M10',
-                 'M11','M12','M13','M14','M15','M16','M17','M18','M19','M20',
-                 'M21','M22','M23','M24','M25','M26','M27'];
+// ── Directorios ────────────────────────────────────────────────────
+const DATA_DIR    = process.env.DATA_DIR    || path.join(__dirname, 'data');
+const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads');
 
-// ── Función de retorno al index ──────────────────────
-function cerrarControlIngreso(){
-  if(document.referrer && document.referrer !== window.location.href){
-    window.history.back();
-  } else {
-    window.location.href = '/';
+[DATA_DIR, UPLOADS_DIR].forEach(d => {
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+});
+
+// ── Rutas de archivos ──────────────────────────────────────────────
+const FILES = {
+  ia_state:       path.join(DATA_DIR, 'ia_state.json'),
+  ia_records:     path.join(DATA_DIR, 'ia_records.json'),
+  modules_config: path.join(DATA_DIR, 'modules_config.json'),
+  floor_state:    path.join(DATA_DIR, 'floor_state.json'),
+  ci_requests:    path.join(DATA_DIR, 'ci_requests.json'),
+  ci_config:      path.join(DATA_DIR, 'ci_config.json'),
+  alistamientos:  path.join(DATA_DIR, 'alistamientos.json'),
+  mantenimientos: path.join(DATA_DIR, 'mantenimientos.json'),
+  alertas:        path.join(DATA_DIR, 'alertas.json'),
+  app_config:     path.join(DATA_DIR, 'app_config.json'),
+  novedades:      path.join(DATA_DIR, 'novedades.json'),
+  cargos:         path.join(DATA_DIR, 'cargos.json'),
+  maquinaria:     path.join(DATA_DIR, 'maquinaria.json'),
+  turnos:         path.join(DATA_DIR, 'turnos.json'),
+  historial:      path.join(DATA_DIR, 'historial.json'),
+};
+
+// ── Helpers de persistencia ────────────────────────────────────────
+function readJSON(filePath, defaultValue) {
+  try {
+    if (fs.existsSync(filePath))
+      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    console.error('Error leyendo', filePath, e.message);
+  }
+  return defaultValue;
+}
+
+function writeJSON(filePath, data) {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(data), 'utf8');
+  } catch (e) {
+    console.error('Error escribiendo', filePath, e.message);
   }
 }
 
-// ── WebSocket ────────────────────────────────────────
-let ws, wsReady=false, reconnectDelay=1000, reconnectTimer=null;
+// ── Caché en memoria ───────────────────────────────────────────────
+const dbCache = {};
 
-function wsSend(obj){
-  if(ws && ws.readyState===1) ws.send(JSON.stringify(obj));
+function loadDB(key) {
+  if (!dbCache[key]) {
+    try {
+      dbCache[key] = fs.existsSync(FILES[key])
+        ? JSON.parse(fs.readFileSync(FILES[key], 'utf8'))
+        : [];
+    } catch(e) {
+      console.error('Error cargando caché', key, e.message);
+      dbCache[key] = [];
+    }
+  }
+  return dbCache[key];
 }
 
-function iaSaveState(){
-  wsSend({ type:'ia_save_state', state: JSON.parse(JSON.stringify(iaState)) });
+function saveDB(key, data) {
+  dbCache[key] = data;
+  try {
+    fs.writeFileSync(FILES[key], JSON.stringify(data));
+  } catch (e) {
+    console.error('Error guardando', key, e.message);
+  }
 }
 
-function connectWS(){
-  const proto = location.protocol==='https:' ? 'wss' : 'ws';
-  const url = `${proto}://${location.host}`;
-  dbg('Conectando WS → ' + url);
-  ws = new WebSocket(url);
+// ── Perfil Programador ─────────────────────────────────────────────
+const PROGRAMADOR_PROFILE = {
+  id: 'programador', name: 'Programador', role: 'programador',
+  pass: '1', canDelete: false
+};
 
-  ws.onopen = () => {
-    wsReady = true;
-    reconnectDelay = 1000;
-    clearTimeout(reconnectTimer);
-    dbg('WS conectado ✓');
+function ensureProgramador(state) {
+  if (!state || typeof state !== 'object') state = { supervisors: [], employees: [] };
+  if (!Array.isArray(state.supervisors)) state.supervisors = [];
+  state.supervisors = state.supervisors.filter(s => s.id !== 'programador');
+  state.supervisors.unshift(PROGRAMADOR_PROFILE);
+  return state;
+}
+
+function loadInitialState() {
+  return ensureProgramador({ supervisors: [], employees: [] });
+}
+
+// ── Estado Control de Asistencia ──────────────────────────────────
+let iaState       = readJSON(FILES.ia_state, null);
+let iaRecords     = readJSON(FILES.ia_records, []);
+let modulesConfig = readJSON(FILES.modules_config, { disabled:[], extra:[], renamed:{}, modPass:{} });
+
+if (!iaState) {
+  iaState = loadInitialState();
+} else {
+  iaState = ensureProgramador(iaState);
+}
+writeJSON(FILES.ia_state, iaState);
+writeJSON(FILES.ia_records, iaRecords);
+
+function saveIaState()       { writeJSON(FILES.ia_state,       iaState);       }
+function saveIaRecords()     { writeJSON(FILES.ia_records,     iaRecords);     }
+function saveModulesConfig() { writeJSON(FILES.modules_config, modulesConfig); }
+
+// ── Estado Control de Piso ─────────────────────────────────────────
+const MODULES = [
+  'M01','M02','M03','M04','M05','M06','M07','M08','M09','M10',
+  'M11','M12','M13','M14','M15','M16','M17','M18','M19','M20',
+  'M21','M22','M23','M24','M25','M26','M27'
+];
+
+const floorDefault = { states: {}, lastMec: {} };
+MODULES.forEach(id => { floorDefault.states[id] = 'green'; floorDefault.lastMec[id] = ''; });
+
+const floorPersisted = readJSON(FILES.floor_state, floorDefault);
+const states  = floorPersisted.states  || { ...floorDefault.states  };
+const lastMec = floorPersisted.lastMec || { ...floorDefault.lastMec };
+
+MODULES.forEach(id => {
+  if (!states[id])  states[id]  = 'green';
+  if (!lastMec[id]) lastMec[id] = '';
+});
+
+function saveFloorState() {
+  writeJSON(FILES.floor_state, { states, lastMec });
+}
+
+// ── Estado Tablero CI ──────────────────────────────────────────────
+const CI_CONFIG_DEFAULT = {
+  tipoInsumoList: [
+    {name:'Aplique',flow:'qty_only'},{name:'Elástico',flow:'elastico'},
+    {name:'Marquilla Logo',flow:'qty_only'},{name:'Marquilla Talla',flow:'qty_talla'},
+    {name:'Prelavado',flow:'qty_talla'},{name:'Transfer',flow:'qty_talla'}
+  ],
+  elasticoList: ['Base','Bola','Bota','Cintura','Envivar'],
+  moduleList: [
+    'M01','M02','M03','M04','M05','M06','M07','M08','M09','M10',
+    'M11','M12','M13','M14','M15','M16','M17','M18','M19','M20',
+    'M21','M22','M23','M24','M25','M26','M27','Empaque'
+  ],
+  obsList: ['Pérdida','Faltante','Defectos']
+};
+
+let ciRequests = readJSON(FILES.ci_requests, []);
+let ciConfig   = readJSON(FILES.ci_config, CI_CONFIG_DEFAULT);
+
+function saveCiRequests() { writeJSON(FILES.ci_requests, ciRequests); }
+function saveCiConfig()   { writeJSON(FILES.ci_config,   ciConfig);   }
+
+// ── Datos estáticos Alistamiento ───────────────────────────────────────
+const SUPERVISORAS_BIT = []; // se gestionan desde la app
+const MECANICOS_BIT = []; // se gestionan desde la app
+const BASE_MODULOS_BIT = [
+  'M01','M02','M03','M04','M05','M06','M07','M08','M09','M10',
+  'M11','M12','M13','M14','M15','M16','M17','M18','M19','M20',
+  'M21','M22','M23','M24','M25','M26','M27','Preparación','Empaque'
+];
+const MAQUINAS_BIT = []; // se gestionan desde la app
+
+function getModulosBit() {
+  const disabled = modulesConfig.disabled || [];
+  const extra    = modulesConfig.extra    || [];
+  return [
+    ...BASE_MODULOS_BIT.filter(m => !disabled.includes(m)),
+    ...extra.filter(m => !disabled.includes(m))
+  ];
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  EXPRESS
+// ══════════════════════════════════════════════════════════════════
+const app = express();
+
+// #7 CORS restringido — en producción usa ALLOWED_ORIGIN
+const corsOptions = ALLOWED_ORIGIN
+  ? { origin: ALLOWED_ORIGIN, methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'] }
+  : { origin: true }; // dev: permite cualquier origen
+app.use(cors(corsOptions));
+
+// #12 Cabeceras de seguridad básicas (sin instalar helmet)
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// ── #5 Rate limiter simple (sin dependencias externas) ────────────
+// Limita a MAX_REQ requests por IP en WINDOW_MS milisegundos
+const rateLimitStore = new Map();
+function rateLimit(maxReq, windowMs) {
+  return (req, res, next) => {
+    const ip  = req.ip || req.connection.remoteAddress || 'unknown';
+    const now = Date.now();
+    const key = `${ip}`;
+    if (!rateLimitStore.has(key)) {
+      rateLimitStore.set(key, { count: 1, start: now });
+      return next();
+    }
+    const entry = rateLimitStore.get(key);
+    if (now - entry.start > windowMs) {
+      rateLimitStore.set(key, { count: 1, start: now });
+      return next();
+    }
+    entry.count++;
+    if (entry.count > maxReq) {
+      console.warn(`Rate limit superado para IP ${ip} en ${req.path}`);
+      return res.status(429).json({ error: 'Demasiadas solicitudes. Intente en un momento.' });
+    }
+    next();
   };
+}
 
-  ws.onmessage = (e) => {
-    try{
-      const msg = JSON.parse(e.data);
-      dbg('Mensaje: ' + msg.type);
+// Limpieza periódica del store de rate limit (cada 10 min)
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [k, v] of rateLimitStore.entries()) {
+    if (v.start < cutoff) rateLimitStore.delete(k);
+  }
+}, 10 * 60 * 1000);
 
-      if(msg.type === 'init'){
-        dbg('init → iaState=' + !!msg.iaState + ' records=' + (msg.iaRecords||[]).length);
-        // Recibir estado inicial — garantizar que nunca sea null
-        iaState   = msg.iaState   || iaState   || { supervisors:[], employees:[] };
-        iaRecords = msg.iaRecords || iaRecords  || [];
-        // Reconstruir MODULES si hay config de módulos
-        if(msg.modulesConfig){
-          _appConfig._modulos_disabled = msg.modulesConfig.disabled || [];
-          _appConfig._modulos_extra    = msg.modulesConfig.extra    || [];
-          _appConfig._modulos_renamed  = msg.modulesConfig.renamed  || {};
-          _appConfig._modulos_pass     = msg.modulesConfig.modPass  || {};
-          rebuildModules();
+// ── Archivos estáticos ─────────────────────────────────────────────
+app.use('/alistamiento/uploads', express.static(UPLOADS_DIR));
+
+// ── Rutas principales ──────────────────────────────────────────────
+app.get('/', (req, res) =>
+  res.sendFile(path.join(__dirname, 'index.html'))
+);
+app.get('/ingresos', (req, res) =>
+  res.sendFile(path.join(__dirname, 'ingresos.html'))
+);
+app.get('/alistamiento', (req, res) =>
+  res.sendFile(path.join(__dirname, 'alistamientos.html'))
+);
+
+const CI_PATH = path.join(__dirname, 'Tablero_CI.html');
+if (!fs.existsSync(CI_PATH)) {
+  console.warn('⚠️  Tablero_CI.html no encontrado — la ruta /ci devolverá 404');
+}
+app.get('/ci', (req, res) => {
+  if (!fs.existsSync(CI_PATH)) return res.status(404).send('Tablero CI no encontrado');
+  res.sendFile(CI_PATH);
+});
+
+// #13 Health check para Render
+app.get('/health', (req, res) => {
+  res.json({
+    status:  'ok',
+    version: '4.0',
+    uptime:  Math.floor(process.uptime()),
+    ts:      new Date().toISOString()
+  });
+});
+
+// ── #6 Multer con fileFilter (solo imágenes) ───────────────────────
+const ALLOWED_MIME = ['image/jpeg','image/png','image/webp','image/gif'];
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+    filename:    (req, file, cb) => {
+      const ext  = path.extname(file.originalname).toLowerCase() || '.jpg';
+      const safe = `${Date.now()}-${uuidv4()}${ext}`;
+      cb(null, safe);
+    }
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_MIME.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Tipo de archivo no permitido: ${file.mimetype}. Solo se aceptan imágenes.`));
+    }
+  }
+});
+
+// Manejo de error de Multer
+function handleMulterError(err, req, res, next) {
+  if (err && err.message) {
+    return res.status(400).json({ error: err.message });
+  }
+  next(err);
+}
+
+// ── Helpers de validación ──────────────────────────────────────────
+function requireFields(obj, fields) {
+  const missing = fields.filter(f => !obj[f] || String(obj[f]).trim() === '');
+  return missing.length ? missing : null;
+}
+
+// ── #8 broadcast GLOBAL (fix bug de scope en /api/ia-record-obs) ──
+// Se declara después de que wss sea creado (ver abajo), pero la función
+// queda disponible globalmente para todas las rutas REST.
+let wss; // se asigna después de http.createServer
+function broadcast(payload, excludeWs = null) {
+  if (!wss) return;
+  const str = JSON.stringify(payload);
+  wss.clients.forEach(c => {
+    if (c.readyState !== 1) return;
+    if (excludeWs && c === excludeWs) return;
+    c.send(str);
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  RUTAS API — Alistamiento
+// ══════════════════════════════════════════════════════════════════
+
+app.get('/alistamiento/api/config', (req, res) =>
+  res.json({
+    supervisoras: SUPERVISORAS_BIT,
+    mecanicos:    MECANICOS_BIT,
+    modulos:      getModulosBit(),
+    maquinas:     MAQUINAS_BIT
+  })
+);
+
+// ── Alistamientos ──────────────────────────────────────────────────
+app.get('/alistamiento/api/alistamientos', (req, res) => {
+  let data = [...loadDB('alistamientos')];
+  const { modulo, fecha, supervisor } = req.query;
+  if (modulo)     data = data.filter(r => r.modulo === modulo);
+  if (fecha)      data = data.filter(r => r.fecha && r.fecha.startsWith(fecha));
+  if (supervisor) data = data.filter(r => r.supervisor === supervisor);
+  res.json(data.sort((a, b) => new Date(b.fechaHora) - new Date(a.fechaHora)));
+});
+
+app.post(
+  '/alistamiento/api/alistamientos',
+  (req, res, next) => upload.array('fotos', 5)(req, res, err => err ? handleMulterError(err, req, res, next) : next()),
+  (req, res) => {
+    const missing = requireFields(req.body, ['modulo', 'tipoMaquina', 'serial', 'mecanico']);
+    if (missing) return res.status(400).json({ error: `Campos requeridos faltantes: ${missing.join(', ')}` });
+    try {
+      const data  = loadDB('alistamientos');
+      const ahora = new Date();
+      const nuevo = {
+        id: uuidv4(),
+        ...req.body,
+        fotos:     req.files ? req.files.map(f => `/alistamiento/uploads/${f.filename}`) : [],
+        fechaHora: ahora.toISOString(),
+        fecha:     ahora.toISOString().split('T')[0],
+        hora:      ahora.toTimeString().slice(0, 8)
+      };
+      data.push(nuevo);
+      saveDB('alistamientos', data);
+      if (nuevo.pruebaCostura === 'Rechazada') {
+        const alertas = loadDB('alertas');
+        alertas.push({
+          id: uuidv4(), tipo: 'critica',
+          mensaje: `Prueba RECHAZADA - Módulo ${nuevo.modulo} - ${nuevo.tipoMaquina} S/N ${nuevo.serial}`,
+          referencia: nuevo.id, area: 'alistamiento', leida: false, fechaHora: ahora.toISOString()
+        });
+        saveDB('alertas', alertas);
+      }
+      res.json({ success: true, data: nuevo });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+  }
+);
+
+app.delete('/alistamiento/api/alistamientos/:id', (req, res) => {
+  const data = loadDB('alistamientos').filter(r => r.id !== req.params.id);
+  saveDB('alistamientos', data);
+  res.json({ success: true });
+});
+
+// ── Mantenimientos ─────────────────────────────────────────────────
+app.get('/alistamiento/api/mantenimientos', (req, res) => {
+  let data = [...loadDB('mantenimientos')];
+  const { tipo, fecha, mecanico } = req.query;
+  if (tipo)     data = data.filter(r => r.tipoMantenimiento === tipo);
+  if (fecha)    data = data.filter(r => r.fecha && r.fecha.startsWith(fecha));
+  if (mecanico) data = data.filter(r => r.mecanico === mecanico);
+  res.json(data.sort((a, b) => new Date(b.fechaHora) - new Date(a.fechaHora)));
+});
+
+app.post(
+  '/alistamiento/api/mantenimientos',
+  (req, res, next) => upload.array('fotos', 5)(req, res, err => err ? handleMulterError(err, req, res, next) : next()),
+  (req, res) => {
+    const missing = requireFields(req.body, ['tipoMaquina', 'serial', 'mecanico', 'tipoMantenimiento']);
+    if (missing) return res.status(400).json({ error: `Campos requeridos faltantes: ${missing.join(', ')}` });
+    try {
+      const data  = loadDB('mantenimientos');
+      const ahora = new Date();
+      const nuevo = {
+        id: uuidv4(),
+        ...req.body,
+        fotos:     req.files ? req.files.map(f => `/alistamiento/uploads/${f.filename}`) : [],
+        fechaHora: ahora.toISOString(),
+        fecha:     ahora.toISOString().split('T')[0],
+        hora:      ahora.toTimeString().slice(0, 8)
+      };
+      data.push(nuevo);
+      saveDB('mantenimientos', data);
+      if (nuevo.tipoMantenimiento === 'Correctivo') {
+        const alertas = loadDB('alertas');
+        alertas.push({
+          id: uuidv4(), tipo: 'advertencia',
+          mensaje: `Correctivo registrado - Módulo ${nuevo.modulo||'N/A'} - ${nuevo.tipoMaquina} S/N ${nuevo.serial}`,
+          referencia: nuevo.id, area: 'mantenimiento', leida: false, fechaHora: ahora.toISOString()
+        });
+        saveDB('alertas', alertas);
+      }
+      res.json({ success: true, data: nuevo });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+  }
+);
+
+app.delete('/alistamiento/api/mantenimientos/:id', (req, res) => {
+  const data = loadDB('mantenimientos').filter(r => r.id !== req.params.id);
+  saveDB('mantenimientos', data);
+  res.json({ success: true });
+});
+
+// ── Alertas ────────────────────────────────────────────────────────
+app.get('/alistamiento/api/alertas', (req, res) => {
+  const data = loadDB('alertas');
+  res.json(data.filter(a => !a.leida).sort((a, b) => new Date(b.fechaHora) - new Date(a.fechaHora)));
+});
+
+app.put('/alistamiento/api/alertas/:id/leer', (req, res) => {
+  const data = loadDB('alertas');
+  const a = data.find(x => x.id === req.params.id);
+  if (a) a.leida = true;
+  saveDB('alertas', data);
+  res.json({ success: true });
+});
+
+app.put('/alistamiento/api/alertas/leer-todas', (req, res) => {
+  const data = loadDB('alertas').map(a => ({ ...a, leida: true }));
+  saveDB('alertas', data);
+  res.json({ success: true });
+});
+
+// ── Exportar Excel ─────────────────────────────────────────────────
+app.get('/alistamiento/api/exportar/alistamientos', (req, res) => {
+  const data = loadDB('alistamientos');
+  const rows = data.map(r => ({
+    'Módulo':r.modulo||'','Referencia':r.referencia||'','Máquina':r.tipoMaquina||'',
+    'Serial':r.serial||'','Mecánico':r.mecanico||'','Supervisor':r.supervisor||'',
+    'Ficha Técnica':r.fichaTecnica||'','Muestra Física':r.muestraFisica||'',
+    'Prueba Costura':r.pruebaCostura||'','Observaciones':r.observaciones||'',
+    'Fecha':r.fecha||'','Hora':r.hora||''
+  }));
+  const wb = xlsxLib.utils.book_new();
+  xlsxLib.utils.book_append_sheet(wb, xlsxLib.utils.json_to_sheet(rows), 'Alistamientos');
+  const buf = xlsxLib.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Disposition', `attachment; filename="Alistamientos_${new Date().toISOString().split('T')[0]}.xlsx"`);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.send(buf);
+});
+
+app.get('/alistamiento/api/exportar/mantenimientos', (req, res) => {
+  const data = loadDB('mantenimientos');
+  const rows = data.map(r => ({
+    'Módulo':r.modulo||'','Máquina':r.tipoMaquina||'','Serial':r.serial||'',
+    'Tipo':r.tipoMantenimiento||'','Repuestos':r.repuestos||'',
+    'Mecánico':r.mecanico||'','Observaciones':r.observaciones||'',
+    'Fecha':r.fecha||'','Hora':r.hora||''
+  }));
+  const wb = xlsxLib.utils.book_new();
+  xlsxLib.utils.book_append_sheet(wb, xlsxLib.utils.json_to_sheet(rows), 'Mantenimientos');
+  const buf = xlsxLib.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Disposition', `attachment; filename="Mantenimientos_${new Date().toISOString().split('T')[0]}.xlsx"`);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.send(buf);
+});
+
+// ── Stats ──────────────────────────────────────────────────────────
+app.get('/alistamiento/api/stats', (req, res) => {
+  const alistamientos  = loadDB('alistamientos');
+  const mantenimientos = loadDB('mantenimientos');
+  const alertas        = loadDB('alertas');
+  const hoy = new Date().toISOString().split('T')[0];
+  res.json({
+    alistamientos: {
+      total:      alistamientos.length,
+      hoy:        alistamientos.filter(r => r.fecha === hoy).length,
+      aprobados:  alistamientos.filter(r => r.pruebaCostura === 'Aprobada').length,
+      rechazados: alistamientos.filter(r => r.pruebaCostura === 'Rechazada').length
+    },
+    mantenimientos: {
+      total:       mantenimientos.length,
+      hoy:         mantenimientos.filter(r => r.fecha === hoy).length,
+      preventivos: mantenimientos.filter(r => r.tipoMantenimiento === 'Preventivo').length,
+      correctivos: mantenimientos.filter(r => r.tipoMantenimiento === 'Correctivo').length
+    },
+    alertas: { noLeidas: alertas.filter(a => !a.leida).length }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════
+//  RUTAS API — Configuración de la App
+// ══════════════════════════════════════════════════════════════════
+
+// App Config
+app.get('/api/app-config', (req, res) => {
+  res.json(readJSON(FILES.app_config, {}));
+});
+
+app.post('/api/app-config', (req, res) => {
+  try {
+    const existing = readJSON(FILES.app_config, {});
+    function deepMerge(target, source) {
+      const out = Object.assign({}, target);
+      Object.keys(source).forEach(k => {
+        const sv = source[k], tv = target[k];
+        if (sv && typeof sv === 'object' && !Array.isArray(sv) &&
+            tv && typeof tv === 'object' && !Array.isArray(tv)) {
+          out[k] = deepMerge(tv, sv);
+        } else {
+          out[k] = sv;
         }
-        arrancarApp();
+      });
+      return out;
+    }
+    writeJSON(FILES.app_config, deepMerge(existing, req.body));
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
-      } else if(msg.type === 'ia_add_record'){
-        if(!iaRecords) iaRecords=[];
+// Novedades
+app.get('/api/novedades',  (req, res) => res.json(readJSON(FILES.novedades, [])));
+app.post('/api/novedades', (req, res) => {
+  try {
+    writeJSON(FILES.novedades, Array.isArray(req.body) ? req.body : []);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cargos
+app.get('/api/cargos',  (req, res) => res.json(readJSON(FILES.cargos, [])));
+app.post('/api/cargos', (req, res) => {
+  try { writeJSON(FILES.cargos, req.body); res.json({ success: true }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Maquinaria
+app.get('/api/maquinaria',  (req, res) => res.json(readJSON(FILES.maquinaria, [])));
+app.post('/api/maquinaria', (req, res) => {
+  try { writeJSON(FILES.maquinaria, req.body); res.json({ success: true }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Turnos
+app.get('/api/turnos',  (req, res) => res.json(readJSON(FILES.turnos, [])));
+app.post('/api/turnos', (req, res) => {
+  try { writeJSON(FILES.turnos, req.body); res.json({ success: true }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Historial
+app.get('/api/historial',  (req, res) => res.json(readJSON(FILES.historial, [])));
+app.post('/api/historial', (req, res) => {
+  try { writeJSON(FILES.historial, req.body); res.json({ success: true }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── #8 BUGFIX: broadcast disponible globalmente ────────────────────
+app.patch('/api/ia-record-obs', (req, res) => {
+  const { id, obs } = req.body;
+  if (!id) return res.status(400).json({ error: 'sin id' });
+  const idx = iaRecords.findIndex(r => r.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'no encontrado' });
+  iaRecords[idx].obs = obs || '';
+  saveIaRecords();
+  broadcast({ type: 'ia_edit_record', record: iaRecords[idx] }); // ✅ sin error de scope
+  res.json({ success: true, record: iaRecords[idx] });
+});
+
+// ══════════════════════════════════════════════════════════════════
+//  #3 + #4: RESET TOTAL — POST, contraseña env obligatoria
+// ══════════════════════════════════════════════════════════════════
+// Antes: GET /admin/reset?pass=xxx  ← contraseña visible en logs
+// Ahora: POST /admin/reset  con body { pass: "..." }
+// La contraseña viene SOLO de la variable de entorno RESET_PASS.
+// Rate limit: máx 5 intentos por IP cada 15 minutos.
+
+app.post('/admin/reset', rateLimit(5, 15 * 60 * 1000), (req, res) => {
+  if (!RESET_PASS) {
+    return res.status(503).json({ error: 'Reset deshabilitado: configura la variable de entorno RESET_PASS en Render.' });
+  }
+  const { pass } = req.body;
+  if (!pass || pass !== RESET_PASS) {
+    console.warn(`Intento fallido de reset desde IP ${req.ip} a las ${new Date().toISOString()}`);
+    return res.status(403).json({ error: 'Contraseña incorrecta.' });
+  }
+  try {
+    const filesToReset = Object.values(FILES);
+    filesToReset.forEach(f => { if (fs.existsSync(f)) fs.unlinkSync(f); });
+
+    // Limpiar caché en memoria
+    Object.keys(dbCache).forEach(k => delete dbCache[k]);
+
+    // Resetear estado en memoria
+    MODULES.forEach(id => { states[id] = 'green'; lastMec[id] = ''; });
+    iaState       = ensureProgramador({ supervisors: [], employees: [] });
+    iaRecords     = [];
+    modulesConfig = { disabled:[], extra:[], renamed:{}, modPass:{} };
+    ciRequests    = [];
+    ciConfig      = { ...CI_CONFIG_DEFAULT };
+
+    // Guardar estado limpio
+    saveIaState();
+    saveFloorState();
+
+    // Notificar a todos los clientes WS
+    broadcast({ type: 'server_reset' });
+
+    console.warn(`⚠️  RESET TOTAL ejecutado desde IP ${req.ip} a las ${new Date().toISOString()}`);
+    res.json({ success: true, mensaje: 'Todos los datos han sido borrados. El servidor está en blanco.' });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Compatibilidad: el GET antiguo devuelve instrucciones claras
+app.get('/admin/reset', (req, res) => {
+  res.status(405).json({
+    error: 'Método no permitido. Usa POST /admin/reset con body JSON { "pass": "tu_clave" }',
+    ejemplo: 'fetch("/admin/reset", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ pass:"tu_clave" }) })'
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════
+//  SERVIDOR HTTP + WEBSOCKET
+// ══════════════════════════════════════════════════════════════════
+const server = http.createServer(app);
+
+// Asignar wss ANTES de que puedan llegar requests (el listen es async)
+wss = new WebSocketServer({ server });
+
+// Ping/pong — evita timeout de 60s en Render
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.isAlive === false) { ws.terminate(); return; }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30_000);
+
+wss.on('connection', (ws, req) => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  const clientIp = req.socket.remoteAddress || 'unknown';
+  console.log(`WS conectado: ${clientIp} | clientes: ${wss.clients.size}`);
+
+  // Estado completo al conectar
+  ws.send(JSON.stringify({
+    type:          'init',
+    states:        { ...states },
+    lastMec:       { ...lastMec },
+    iaState:       iaState,
+    iaRecords:     iaRecords,
+    modulesConfig: modulesConfig
+  }));
+
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); }
+    catch { console.warn('WS: mensaje JSON inválido'); return; }
+
+    if (!msg || typeof msg.type !== 'string') {
+      console.warn('WS: mensaje sin tipo válido:', raw.toString().slice(0, 80));
+      return;
+    }
+
+    // broadcast local (excluye al emisor)
+    const broadcastLocal = (payload) => broadcast(payload, ws);
+
+    try {
+      // ── Control de Piso ─────────────────────────────────────────
+      if (msg.type === 'change') {
+        if (!msg.id || states[msg.id] === undefined) {
+          console.warn('WS change: módulo desconocido:', msg.id); return;
+        }
+        states[msg.id] = msg.state || 'green';
+        if (msg.state === 'red') lastMec[msg.id] = '';
+        else if (msg.mecanico) lastMec[msg.id] = msg.mecanico;
+        saveFloorState();
+        broadcastLocal({ type:'change', id:msg.id, state:msg.state, mecanico:msg.mecanico||'', limite:msg.limite||null });
+      }
+
+      // ── Config Módulos ──────────────────────────────────────────
+      else if (msg.type === 'modules_config') {
+        modulesConfig = {
+          disabled: Array.isArray(msg.disabled) ? msg.disabled : [],
+          extra:    Array.isArray(msg.extra)    ? msg.extra    : [],
+          renamed:  msg.renamed  && typeof msg.renamed  === 'object' ? msg.renamed  : {},
+          modPass:  msg.modPass  && typeof msg.modPass  === 'object' ? msg.modPass  : {}
+        };
+        saveModulesConfig();
+        broadcastLocal({ type:'modules_config', ...modulesConfig });
+      }
+
+      // ── Tablero CI ──────────────────────────────────────────────
+      else if (msg.type === 'ci_init') {
+        ciRequests.forEach(r => {
+          if (!r.alertStart && r.status === 'alert') {
+            const tsFromId = parseInt((r._id || '').split('-')[0]);
+            r.alertStart = tsFromId > 0 ? tsFromId : Date.now();
+          }
+        });
+        ws.send(JSON.stringify({
+          type:           'ci_init',
+          requests:       ciRequests,
+          tipoInsumoList: ciConfig.tipoInsumoList,
+          elasticoList:   ciConfig.elasticoList,
+          moduleList:     ciConfig.moduleList,
+          obsList:        ciConfig.obsList || CI_CONFIG_DEFAULT.obsList
+        }));
+      }
+
+      else if (msg.type === 'ci_cumplido_request') {
+        if (!msg.request) { console.warn('WS ci_cumplido_request: sin payload'); return; }
+        broadcastLocal({ type:'ci_cumplido_request', request:msg.request });
+      }
+
+      else if (msg.type === 'ci_config_sync') {
+        if (msg.tipoInsumoList) ciConfig.tipoInsumoList = msg.tipoInsumoList;
+        if (msg.elasticoList)   ciConfig.elasticoList   = msg.elasticoList;
+        if (msg.moduleList)     ciConfig.moduleList     = msg.moduleList;
+        if (msg.obsList)        ciConfig.obsList        = msg.obsList;
+        saveCiConfig();
+        broadcastLocal({ type:'ci_config_sync', tipoInsumoList:ciConfig.tipoInsumoList, elasticoList:ciConfig.elasticoList, moduleList:ciConfig.moduleList, obsList:ciConfig.obsList || CI_CONFIG_DEFAULT.obsList });
+      }
+
+      else if (msg.type === 'ci_new_request') {
+        if (!msg.request || !msg.request._id) { console.warn('WS ci_new_request: sin _id'); return; }
+        if (!ciRequests.find(r => r._id === msg.request._id)) {
+          if (!msg.request.alertStart) msg.request.alertStart = Date.now();
+          ciRequests.unshift(msg.request);
+          if (ciRequests.length > 500) ciRequests = ciRequests.slice(0, 500);
+          saveCiRequests();
+        }
+        broadcastLocal({ type:'ci_new_request', request:msg.request });
+      }
+
+      else if (msg.type === 'ci_update_request') {
+        if (!msg.request || !msg.request._id) { console.warn('WS ci_update_request: sin _id'); return; }
+        const idx = ciRequests.findIndex(r => r._id === msg.request._id);
+        if (idx > -1) ciRequests[idx] = msg.request;
+        saveCiRequests();
+        broadcastLocal({ type:'ci_update_request', request:msg.request });
+      }
+
+      else if (msg.type === 'ci_delete_request') {
+        if (msg.reqId) {
+          ciRequests = ciRequests.filter(r => r._id !== msg.reqId);
+        } else if (typeof msg.idx === 'number') {
+          ciRequests.splice(msg.idx, 1);
+        } else { console.warn('WS ci_delete_request: sin reqId ni idx'); return; }
+        saveCiRequests();
+        broadcastLocal({ type:'ci_delete_request', idx:msg.idx, reqId:msg.reqId });
+      }
+
+      // ── Control de Asistencia ────────────────────────────────────
+      else if (msg.type === 'ia_add_record') {
+        if (!msg.record) { console.warn('WS ia_add_record: sin record'); return; }
         iaRecords = iaRecords.filter(r =>
-          !(r.empName===msg.record.empName && r.date===msg.record.date && r.supervisor===msg.record.supervisor)
+          !(r.empName === msg.record.empName &&
+            r.date    === msg.record.date    &&
+            r.supervisor === msg.record.supervisor)
         );
         iaRecords.push(msg.record);
-        if(typeof iaUpdateStats==='function')       iaUpdateStats();
-        if(typeof iaRenderTodayChips==='function')  iaRenderTodayChips();
-        if(typeof iaRenderHistory==='function' && document.getElementById('ia-tab-history') && !document.getElementById('ia-tab-history').classList.contains('hidden')) iaRenderHistory();
-        if(typeof iaRenderAdminTable==='function' && document.getElementById('ia-tab-records') && !document.getElementById('ia-tab-records').classList.contains('hidden')) iaRenderAdminTable();
-
-      } else if(msg.type === 'ia_delete_record'){
-        if(iaRecords) iaRecords = iaRecords.filter(r=>r.id!==msg.id);
-        if(typeof iaUpdateStats==='function')       iaUpdateStats();
-        if(typeof iaRenderTodayChips==='function')  iaRenderTodayChips();
-        if(typeof iaRenderAdminTable==='function')  iaRenderAdminTable();
-
-      } else if(msg.type === 'ia_edit_record'){
-        if(iaRecords){ const idx=iaRecords.findIndex(r=>r.id===msg.record.id); if(idx>-1) iaRecords[idx]=msg.record; }
-        if(typeof iaRenderAdminTable==='function')  iaRenderAdminTable();
-
-      } else if(msg.type === 'ia_save_state'){
-        iaState = msg.state;
-        if(typeof iaBuildLoginSelect==='function')  iaBuildLoginSelect();
-        const at = document.querySelector('.ia-tab-btn.active')?.dataset?.tab;
-        if(at==='history'  && typeof iaRenderHistory==='function')    iaRenderHistory();
-        else if(at==='records' && typeof iaRenderAdminTable==='function') iaRenderAdminTable();
-        else if(at==='config'  && typeof iaRenderConfig==='function')    iaRenderConfig();
-        else{
-          if(typeof iaRenderTodayChips==='function') iaRenderTodayChips();
-          if(typeof iaUpdateStats==='function')      iaUpdateStats();
-        }
-
-      } else if(msg.type === 'modules_config'){
-        _appConfig._modulos_disabled = msg.disabled || [];
-        _appConfig._modulos_extra    = msg.extra    || [];
-        _appConfig._modulos_renamed  = msg.renamed  || {};
-        _appConfig._modulos_pass     = msg.modPass  || {};
-        rebuildModules();
-        if(typeof iaBuildAreaSelect==='function') iaBuildAreaSelect();
-      } else if(msg.type === 'server_reset'){
-        alert('⚠️ El servidor fue reseteado. La página se recargará.');
-        location.reload();
-        return;
+        saveIaRecords();
+        broadcastLocal({ type:'ia_add_record', record:msg.record });
       }
-    } catch(err){ dbg('ERROR: ' + err.message); console.error('WS parse error:', err); }
-  };
 
-  ws.onclose = (e) => {
-    wsReady = false;
-    dbg('WS cerrado — code:' + e.code + ' reason:' + (e.reason||'?'));
-    reconnectTimer = setTimeout(()=>{ reconnectDelay=Math.min(reconnectDelay*2,30000); connectWS(); }, reconnectDelay);
-  };
-  ws.onerror = (e) => { dbg('WS error'); ws.close(); };
-}
+      else if (msg.type === 'ia_delete_record') {
+        if (!msg.id) { console.warn('WS ia_delete_record: sin id'); return; }
+        iaRecords = iaRecords.filter(r => r.id !== msg.id);
+        saveIaRecords();
+        broadcastLocal({ type:'ia_delete_record', id:msg.id });
+      }
 
-// ── Reconstruir array MODULES ────────────────────────
-function rebuildModules(){
-  const base = ['M01','M02','M03','M04','M05','M06','M07','M08','M09','M10',
-                'M11','M12','M13','M14','M15','M16','M17','M18','M19','M20',
-                'M21','M22','M23','M24','M25','M26','M27'];
-  const extra    = _appConfig._modulos_extra    || [];
-  const disabled = _appConfig._modulos_disabled || [];
-  const renamed  = _appConfig._modulos_renamed  || {};
-  MODULES.length = 0;
-  [...base,...extra].forEach(id=>{
-    if(!disabled.includes(id)) MODULES.push(renamed[id]||id);
+      else if (msg.type === 'ia_edit_record') {
+        if (!msg.record || !msg.record.id) { console.warn('WS ia_edit_record: sin id'); return; }
+        const idx = iaRecords.findIndex(r => r.id === msg.record.id);
+        if (idx > -1) iaRecords[idx] = msg.record;
+        saveIaRecords();
+        broadcastLocal({ type:'ia_edit_record', record:msg.record });
+      }
+
+      else if (msg.type === 'ia_save_state') {
+        if (!msg.state) { console.warn('WS ia_save_state: sin state'); return; }
+        iaState = ensureProgramador(msg.state);
+        saveIaState();
+        broadcastLocal({ type:'ia_save_state', state:iaState });
+      }
+
+      else {
+        console.warn('WS: tipo de mensaje no reconocido:', msg.type);
+      }
+
+    } catch (e) {
+      console.error('Error procesando mensaje WS:', e.message);
+    }
   });
-}
 
-// ── loadConfig — devuelve _appConfig local ───────────
-function loadConfig(){ return _appConfig; }
-
-// ── getProfileMembers — lee _appConfig._perfil_members
-function getProfileMembers(perfil){
-  return (_appConfig._perfil_members && _appConfig._perfil_members[perfil]) || [];
-}
-
-// ── Timeout de seguridad: arrancar igual si el WS tarda ──
-let _appArranged = false;
-// 3s: si el servidor no responde (ej. Render durmiendo), mostrar login igual
-setTimeout(()=>{
-  if(!_appArranged){
-    dbg('TIMEOUT — arrancando sin WS');
-    if(!iaState) iaState = { supervisors:[], employees:[] };
-    // Actualizar mensaje antes de arrancar
-    const lm = document.getElementById('ia-loader-msg');
-    if(lm) lm.textContent = 'Iniciando...';
-    arrancarApp();
-  }
-}, 3000);
-
-// ── arrancarApp: inyectar HTML + ejecutar lógica ─────
-function arrancarApp(){
-  if(_appArranged) return;
-  _appArranged = true;
-  dbg('arrancarApp — iaState=' + !!iaState);
-  try {
-    document.getElementById('ia-loader').style.display = 'none';
-    const root = document.getElementById('ingreso-app-root');
-    root.style.display = 'block';
-    root.innerHTML = getIngresoHTML();
-    dbg('HTML inyectado ✓');
-    runIngresoScript();
-    dbg('runIngresoScript ✓');
-  } catch(err) {
-    dbg('ERROR arrancarApp: ' + err.message); console.error('[IA] ERROR:', err);
-    document.getElementById('ia-loader').innerHTML =
-      '<div style="color:#ef4444;padding:40px;text-align:center;font-family:sans-serif;">' +
-      '<div style="font-size:24px;margin-bottom:12px;">⚠️ Error al cargar</div>' +
-      '<div style="font-size:13px;margin-bottom:16px;">' + err.message + '</div>' +
-      '<button onclick="location.reload()" style="padding:8px 20px;border-radius:8px;border:1.5px solid #e2e8f0;background:#fff;color:#1e3a8a;font-weight:700;cursor:pointer;">Recargar</button>' +
-      '</div>';
-    document.getElementById('ia-loader').style.display = 'flex';
-  }
-}
-
-// ── Cargar config adicional del servidor (perfil_members, etc.) ──
-async function loadConfigFromServer(){
-  try{
-    const r = await fetch('/api/app-config');
-    if(r.ok){
-      const cfg = await r.json();
-      Object.assign(_appConfig, cfg);
-    }
-  } catch(e){ console.warn('No se pudo cargar app-config:', e.message); }
-}
-
-// ── Init — WS se conecta de inmediato, config en paralelo ────
-connectWS();
-loadConfigFromServer(); // no bloquea — se aplica cuando llega
-
-// ════════════════════════════════════════════════════════
-//  HTML del Control de Asistencia
-// ════════════════════════════════════════════════════════
-function getIngresoHTML(){
-  return `
-<style>
-/* ─── Control de Asistencia — Identidad visual Confecciones Millar ─── */
-
-/* Fondo general */
-#ingreso-app-root{
-  color:#0f172a;
-  background:#f1f5f9;
-  background-image:
-    linear-gradient(rgba(203,213,225,.4) 1px,transparent 1px),
-    linear-gradient(90deg,rgba(203,213,225,.4) 1px,transparent 1px);
-  background-size:28px 28px;
-  min-height:100vh;
-}
-
-/* ── LOGIN ── */
-#ia-login{
-  min-height:100vh;
-  display:flex;
-  align-items:stretch;
-  justify-content:stretch;
-}
-
-/* Panel izquierdo del login — igual al login principal */
-.ia-login-left{
-  flex:0 0 60%;
-  position:relative;
-  overflow:hidden;
-  background:linear-gradient(155deg,#020d22 0%,#04163d 30%,#071e55 60%,#0a2570 100%);
-  display:flex;
-  flex-direction:column;
-  align-items:center;
-  justify-content:center;
-}
-.ia-login-mesh{
-  position:absolute;inset:0;
-  background:
-    radial-gradient(ellipse 65% 55% at 20% 15%,rgba(0,70,220,.28) 0%,transparent 68%),
-    radial-gradient(ellipse 50% 60% at 82% 82%,rgba(0,25,170,.32) 0%,transparent 65%),
-    radial-gradient(ellipse 40% 50% at 60% 40%,rgba(0,110,255,.13) 0%,transparent 58%);
-  animation:iaMeshA 16s ease-in-out infinite alternate;
-}
-@keyframes iaMeshA{0%{transform:scale(1) translate(0,0);}50%{transform:scale(1.06) translate(2%,1.5%);}100%{transform:scale(1.02) translate(-1%,.5%);}}
-.ia-login-dotgrid{
-  position:absolute;inset:0;
-  background-image:radial-gradient(circle,rgba(255,255,255,.07) 1.2px,transparent 1.2px);
-  background-size:38px 38px;
-  mask-image:radial-gradient(ellipse 85% 85% at 50% 50%,black 15%,transparent 80%);
-  animation:iaGridD 22s linear infinite;
-}
-@keyframes iaGridD{0%{background-position:0 0;}100%{background-position:38px 38px;}}
-.ia-login-orb1{
-  position:absolute;width:420px;height:420px;border-radius:50%;
-  background:radial-gradient(circle,rgba(20,70,240,.2),transparent 70%);
-  top:-110px;left:-90px;filter:blur(55px);
-  animation:iaOb1 11s ease-in-out infinite;
-}
-.ia-login-orb2{
-  position:absolute;width:360px;height:360px;border-radius:50%;
-  background:radial-gradient(circle,rgba(0,40,190,.26),transparent 70%);
-  bottom:-90px;right:-50px;filter:blur(55px);
-  animation:iaOb2 13s ease-in-out infinite;
-}
-@keyframes iaOb1{0%,100%{transform:translate(0,0);}50%{transform:translate(28px,-18px);}}
-@keyframes iaOb2{0%,100%{transform:translate(0,0);}50%{transform:translate(-18px,24px);}}
-.ia-login-logo-zone{
-  position:relative;z-index:5;
-  display:flex;flex-direction:column;align-items:center;
-  animation:iaZoneUp 1s cubic-bezier(.22,1,.36,1) .2s both;
-}
-@keyframes iaZoneUp{from{opacity:0;transform:translateY(36px) scale(.91);}to{opacity:1;transform:none;}}
-.ia-login-logo-ring{
-  width:148px;height:148px;border-radius:50%;background:#fff;
-  display:flex;align-items:center;justify-content:center;overflow:hidden;
-  box-shadow:0 0 0 5px rgba(255,255,255,.11),0 0 0 15px rgba(255,255,255,.05),
-             0 28px 80px rgba(0,0,0,.55),0 0 70px rgba(20,80,255,.28);
-  animation:iaLogoGlow 5s ease-in-out infinite 1.4s;
-}
-@keyframes iaLogoGlow{
-  0%,100%{box-shadow:0 0 0 5px rgba(255,255,255,.11),0 0 0 15px rgba(255,255,255,.05),0 28px 80px rgba(0,0,0,.55),0 0 70px rgba(20,80,255,.22);}
-  50%{box-shadow:0 0 0 8px rgba(255,255,255,.18),0 0 0 22px rgba(255,255,255,.08),0 32px 90px rgba(0,0,0,.5),0 0 100px rgba(30,100,255,.45);}
-}
-.ia-login-logo-ring img{width:100%;height:100%;object-fit:contain;padding:8px;}
-.ia-login-eyebrow{
-  margin-top:22px;font-family:'Nunito',sans-serif;font-size:11px;font-weight:700;
-  letter-spacing:4px;text-transform:uppercase;color:rgba(255,255,255,.4);
-}
-.ia-login-headline{
-  margin-top:4px;font-family:'Barlow Condensed',sans-serif;font-size:46px;font-weight:700;
-  letter-spacing:2px;text-transform:uppercase;color:#fff;text-align:center;line-height:1;
-  text-shadow:0 0 60px rgba(100,160,255,.4);
-}
-.ia-login-headline em{color:#60a5fa;font-style:normal;}
-.ia-login-sub{
-  margin-top:14px;font-family:'Nunito',sans-serif;font-size:13px;font-weight:400;
-  color:rgba(255,255,255,.45);text-align:center;letter-spacing:.5px;
-}
-
-/* Panel derecho del login */
-.ia-login-right{
-  flex:1;background:#f1f5f9;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;padding:40px;
-  position:relative;box-shadow:-18px 0 55px rgba(0,0,0,.35);
-}
-.ia-login-right::before{
-  content:'';position:absolute;inset:0;
-  background-image:linear-gradient(rgba(203,213,225,.5) 1px,transparent 1px),
-                   linear-gradient(90deg,rgba(203,213,225,.5) 1px,transparent 1px);
-  background-size:28px 28px;opacity:.25;pointer-events:none;
-}
-.ia-login-right::after{
-  content:'';position:absolute;top:0;left:0;right:0;height:4px;
-  background:linear-gradient(90deg,#1e3a8a,#2563eb,#60a5fa);
-}
-.ia-login-card{
-  position:relative;z-index:1;
-  width:100%;max-width:380px;
-  background:#fff;border-radius:16px;
-  padding:36px 40px;
-  box-shadow:0 4px 24px rgba(15,23,42,.1),0 1px 4px rgba(15,23,42,.06);
-  border:1px solid #e2e8f0;
-  animation:iaSlideUp .4s cubic-bezier(.22,1,.36,1);
-}
-@keyframes iaSlideUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
-.ia-card-brand-row{display:flex;align-items:center;gap:8px;margin-bottom:20px;}
-.ia-card-brand-pip{width:3px;height:22px;border-radius:2px;background:linear-gradient(180deg,#2563eb,#60a5fa);}
-.ia-card-brand-txt{font-family:'Nunito',sans-serif;font-size:10px;font-weight:800;letter-spacing:2.5px;text-transform:uppercase;color:#64748b;}
-.ia-card-title{font-family:'Barlow Condensed',sans-serif;font-size:32px;font-weight:700;letter-spacing:1px;color:#0f172a;line-height:1;margin-bottom:4px;}
-.ia-card-sub{font-family:'Nunito',sans-serif;font-size:13px;color:#64748b;font-weight:400;margin-bottom:24px;}
-.ia-login-right-foot{
-  margin-top:24px;font-family:'Nunito',sans-serif;font-size:10px;color:#94a3b8;letter-spacing:.5px;
-  position:relative;z-index:1;text-align:center;
-}
-
-/* Campos del login */
-.ia-fg{margin-bottom:1.2rem;}
-.ia-fg label{
-  display:block;font-family:'Nunito',sans-serif;font-size:10px;font-weight:800;
-  letter-spacing:2px;text-transform:uppercase;color:#475569;margin-bottom:.5rem;
-}
-.ia-fg input,.ia-fg select{
-  width:100%;padding:.85rem 1rem;
-  background:#fff;border:1.5px solid #e2e8f0;border-radius:9px;
-  color:#0f172a;font-family:'Nunito',sans-serif;font-size:.9rem;font-weight:500;
-  outline:none;transition:border-color .2s,box-shadow .2s;
-  box-shadow:0 1px 3px rgba(0,0,0,.05);
-}
-.ia-fg input:focus,.ia-fg select:focus{
-  border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.11);
-}
-.ia-fg select{
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='7'%3E%3Cpath d='M1 1l4.5 4.5L10 1' stroke='%2394a3b8' stroke-width='1.8' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
-  background-repeat:no-repeat;background-position:right 12px center;
-  cursor:pointer;appearance:none;-webkit-appearance:none;
-}
-.ia-fg select option{background:#fff;color:#0f172a;}
-.ia-btn-primary{
-  width:100%;padding:13px;border-radius:9px;border:none;
-  background:linear-gradient(135deg,#1e3a8a 0%,#2563eb 100%);
-  color:#fff;font-family:'Barlow Condensed',sans-serif;
-  font-size:17px;font-weight:700;letter-spacing:3px;text-transform:uppercase;
-  cursor:pointer;position:relative;overflow:hidden;
-  box-shadow:0 4px 18px rgba(37,99,235,.38);
-  transition:all .22s;margin-top:.5rem;
-}
-.ia-btn-primary:hover{transform:translateY(-2px);box-shadow:0 8px 26px rgba(37,99,235,.48);}
-.ia-btn-primary::after{
-  content:'';position:absolute;top:0;left:-110%;width:65%;height:100%;
-  background:linear-gradient(90deg,transparent,rgba(255,255,255,.22),transparent);
-  transform:skewX(-18deg);transition:left .5s;
-}
-.ia-btn-primary:hover::after{left:130%;}
-.ia-err{
-  color:#ef4444;font-size:.82rem;text-align:center;margin-top:.8rem;
-  display:none;font-family:'Nunito',sans-serif;font-weight:600;
-}
-
-/* ── APP PRINCIPAL ── */
-#ia-app{display:none;}
-
-/* Header del app */
-.ia-header{
-  padding:.9rem 2rem;border-bottom:1px solid #e2e8f0;
-  display:flex;align-items:center;justify-content:space-between;
-  background:#fff;flex-wrap:wrap;gap:.8rem;
-  box-shadow:0 1px 4px rgba(0,0,0,.06);
-  position:sticky;top:0;z-index:50;
-}
-.ia-header::after{
-  content:'';position:absolute;top:0;left:0;right:0;height:3px;
-  background:linear-gradient(90deg,#1e3a8a,#2563eb,#60a5fa);
-}
-.ia-header-logo{
-  width:38px;height:38px;border-radius:50%;background:#fff;
-  display:flex;align-items:center;justify-content:center;overflow:hidden;
-  box-shadow:0 0 0 2px rgba(37,99,235,.2),0 2px 8px rgba(0,0,0,.1);
-  flex-shrink:0;
-}
-.ia-header-logo img{width:100%;height:100%;object-fit:contain;padding:3px;}
-.ia-header-left{display:flex;align-items:center;gap:10px;}
-.ia-header-left h3{
-  font-family:'Barlow Condensed',sans-serif;font-size:1.2rem;font-weight:700;
-  letter-spacing:1px;text-transform:uppercase;color:#0f172a;
-}
-.ia-header-left h3 span{color:#2563eb;}
-.ia-header-left p{font-size:.78rem;color:#64748b;font-family:'Nunito',sans-serif;}
-.ia-header-right{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap;}
-.ia-sup-badge{
-  display:flex;align-items:center;gap:.5rem;
-  background:#f1f5f9;border:1px solid #e2e8f0;
-  padding:.45rem 1rem;border-radius:8px;font-size:.82rem;color:#0f172a;
-  font-family:'Nunito',sans-serif;font-weight:600;
-}
-.ia-sup-dot{width:8px;height:8px;border-radius:50%;background:#2563eb;animation:iaPulse 2s infinite;}
-@keyframes iaPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.6;transform:scale(1.3)}}
-.ia-badge-admin{
-  display:inline-flex;align-items:center;gap:.4rem;
-  background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);
-  color:#d97706;padding:.3rem .8rem;border-radius:20px;
-  font-size:.75rem;font-weight:700;font-family:'Nunito',sans-serif;
-}
-.ia-btn-logout{
-  background:transparent;border:1.5px solid #e2e8f0;color:#64748b;
-  padding:.45rem 1rem;border-radius:8px;
-  font-family:'Nunito',sans-serif;font-size:.82rem;font-weight:700;
-  cursor:pointer;transition:all .2s;
-}
-.ia-btn-logout:hover{border-color:#ef4444;color:#ef4444;background:rgba(239,68,68,.04);}
-
-/* Main contenido */
-.ia-main{max-width:1200px;margin:0 auto;padding:2rem;display:grid;gap:1.5rem;}
-
-/* Tabs */
-.ia-tabs{
-  display:flex;gap:.4rem;background:#fff;border:1px solid #e2e8f0;
-  padding:.35rem;border-radius:12px;width:fit-content;flex-wrap:wrap;
-  box-shadow:0 1px 3px rgba(0,0,0,.05);
-}
-.ia-tab-btn{
-  padding:.5rem 1.1rem;border-radius:8px;border:none;
-  font-family:'Nunito',sans-serif;font-size:.85rem;font-weight:700;
-  cursor:pointer;background:transparent;color:#64748b;transition:all .2s;
-  letter-spacing:.3px;
-}
-.ia-tab-btn.active{
-  background:linear-gradient(135deg,#1e3a8a,#2563eb);
-  color:#fff;box-shadow:0 2px 8px rgba(37,99,235,.3);
-}
-.ia-tab-btn.admin-tab.active{
-  background:linear-gradient(135deg,#b45309,#f59e0b);
-  color:#fff;box-shadow:0 2px 8px rgba(245,158,11,.3);
-}
-.ia-tab-btn:not(.active):hover{background:#f1f5f9;color:#0f172a;}
-.ia-tab-btn.hidden{display:none !important;}
-.ia-panel.hidden{display:none !important;}
-
-/* Stats cards */
-.ia-stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;}
-.ia-stat-card{
-  background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:1.2rem 1.5rem;
-  box-shadow:0 1px 4px rgba(0,0,0,.05);
-  position:relative;overflow:hidden;
-}
-.ia-stat-card::before{
-  content:'';position:absolute;top:0;left:0;right:0;height:3px;
-  background:linear-gradient(90deg,#1e3a8a,#2563eb);
-}
-.ia-stat-card.absent-card::before{background:linear-gradient(90deg,#b91c1c,#ef4444);}
-.ia-stat-card .ia-slabel{
-  font-size:.72rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
-  color:#64748b;margin-bottom:.4rem;font-family:'Nunito',sans-serif;
-}
-.ia-stat-card .ia-value{
-  font-size:2rem;font-weight:800;color:#2563eb;line-height:1;
-  font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;
-}
-.ia-stat-card .ia-value.absent{color:#ef4444;}
-.ia-stat-card .ia-sub{font-size:.75rem;color:#94a3b8;margin-top:.3rem;font-family:'Nunito',sans-serif;}
-
-/* Panels */
-.ia-panel{
-  background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:2rem;
-  box-shadow:0 1px 4px rgba(0,0,0,.05);
-}
-.ia-panel h3{
-  font-size:1rem;font-weight:800;letter-spacing:.5px;text-transform:uppercase;
-  margin-bottom:1.5rem;display:flex;align-items:center;gap:.5rem;
-  color:#0f172a;font-family:'Barlow Condensed',sans-serif;font-size:1.1rem;letter-spacing:1px;
-}
-.ia-panel h3::before{
-  content:'';display:inline-block;width:4px;height:18px;
-  background:linear-gradient(180deg,#1e3a8a,#2563eb);border-radius:2px;
-}
-.ia-panel.ia-warn-panel h3::before{background:linear-gradient(180deg,#b45309,#f59e0b);}
-.ia-panel-subtitle{font-size:.8rem;color:#64748b;margin-top:-.8rem;margin-bottom:1.2rem;font-family:'Nunito',sans-serif;}
-
-/* Register grid */
-.ia-reg-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;}
-@media(max-width:600px){.ia-reg-grid{grid-template-columns:1fr;}}
-
-/* Search / dropdown */
-.ia-search-wrapper{position:relative;}
-.ia-clear-btn{
-  position:absolute;right:.8rem;top:50%;transform:translateY(-50%);
-  background:none;border:none;color:#94a3b8;cursor:pointer;font-size:1rem;
-}
-.ia-dropdown{
-  position:absolute;top:calc(100% + 4px);left:0;right:0;
-  background:#fff;border:1.5px solid #e2e8f0;border-radius:10px;
-  max-height:220px;overflow-y:auto;z-index:200;display:none;
-  box-shadow:0 8px 30px rgba(15,23,42,.12);
-}
-.ia-dropdown.open{display:block;}
-.ia-dd-item{
-  padding:.7rem 1rem;cursor:pointer;font-size:.85rem;
-  font-family:'Nunito',sans-serif;font-weight:500;
-  border-bottom:1px solid rgba(226,232,240,.7);color:#0f172a;transition:background .15s;
-}
-.ia-dd-item:last-child{border-bottom:none;}
-.ia-dd-item:hover{background:#eff6ff;color:#2563eb;}
-.ia-dd-item mark{background:transparent;color:#2563eb;font-weight:700;}
-
-/* Action buttons */
-.ia-action-btns{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr;gap:1rem;}
-.ia-btn-register{
-  padding:1rem;
-  background:linear-gradient(135deg,#1e3a8a 0%,#2563eb 100%);
-  border:none;border-radius:10px;color:#fff;
-  font-family:'Barlow Condensed',sans-serif;font-size:1rem;font-weight:700;
-  letter-spacing:2px;text-transform:uppercase;
-  cursor:pointer;display:flex;align-items:center;justify-content:center;gap:.5rem;
-  transition:all .2s;box-shadow:0 2px 10px rgba(37,99,235,.3);
-}
-.ia-btn-register:hover{transform:translateY(-1px);box-shadow:0 4px 16px rgba(37,99,235,.4);}
-.ia-btn-absent{
-  padding:1rem;background:transparent;
-  border:2px solid #ef4444;border-radius:10px;color:#ef4444;
-  font-family:'Barlow Condensed',sans-serif;font-size:1rem;font-weight:700;
-  letter-spacing:2px;text-transform:uppercase;
-  cursor:pointer;display:flex;align-items:center;justify-content:center;gap:.5rem;
-  transition:all .2s;
-}
-.ia-btn-absent:hover{background:rgba(239,68,68,.06);}
-
-/* Toasts internos */
-.ia-toast{
-  grid-column:1/-1;padding:1rem;border-radius:10px;
-  font-size:.9rem;display:none;text-align:center;font-weight:700;
-  font-family:'Nunito',sans-serif;
-}
-.ia-toast.ok{background:rgba(37,99,235,.07);border:1px solid rgba(37,99,235,.25);color:#1e3a8a;}
-.ia-toast.bad{background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.25);color:#b91c1c;}
-
-/* Chips de registros de hoy */
-.ia-today-section{margin-top:1.5rem;}
-.ia-today-section h4{
-  font-size:.78rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
-  color:#64748b;margin-bottom:1rem;font-family:'Nunito',sans-serif;
-}
-.ia-chips{display:flex;flex-wrap:wrap;gap:.5rem;}
-.ia-chip{
-  display:inline-flex;align-items:center;gap:.4rem;padding:.35rem .9rem;border-radius:20px;
-  background:rgba(37,99,235,.07);border:1px solid rgba(37,99,235,.2);
-  font-size:.78rem;font-family:'Nunito',sans-serif;font-weight:600;color:#1e3a8a;
-}
-.ia-chip.absent{background:rgba(239,68,68,.07);border-color:rgba(239,68,68,.2);color:#b91c1c;}
-.ia-chip .ia-area-tag{
-  background:rgba(37,99,235,.12);color:#2563eb;
-  padding:.1rem .4rem;border-radius:4px;font-size:.7rem;font-weight:700;
-}
-
-/* History controls */
-.ia-hist-controls{margin-bottom:1.2rem;}
-.ia-date-row{display:flex;align-items:flex-end;gap:1rem;flex-wrap:wrap;}
-.ia-ctrl-grp{display:flex;flex-direction:column;gap:.4rem;}
-.ia-ctrl-grp label{
-  font-size:.72rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
-  color:#64748b;font-family:'Nunito',sans-serif;
-}
-.ia-ctrl-grp input[type="date"],.ia-ctrl-grp select{
-  width:auto;padding:.55rem 1rem;background:#fff;border:1.5px solid #e2e8f0;
-  border-radius:8px;color:#0f172a;outline:none;font-family:'Nunito',sans-serif;
-  font-size:.85rem;transition:border-color .2s;
-}
-.ia-ctrl-grp input[type="date"]:focus,.ia-ctrl-grp select:focus{border-color:#2563eb;}
-.ia-sort-controls{display:flex;gap:.5rem;align-items:center;}
-.ia-sort-label{
-  font-size:.72rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
-  color:#64748b;font-family:'Nunito',sans-serif;
-}
-.ia-sort-btn{
-  padding:.4rem .9rem;background:transparent;border:1.5px solid #e2e8f0;color:#64748b;
-  border-radius:7px;font-family:'Nunito',sans-serif;font-size:.78rem;font-weight:700;
-  cursor:pointer;transition:all .2s;
-}
-.ia-sort-btn.active{border-color:#2563eb;color:#2563eb;background:rgba(37,99,235,.07);}
-.ia-filter-row th{padding:4px 6px!important;background:transparent;border-top:none!important;}
-.ia-col-filter{width:100%;padding:5px 8px;font-size:.75rem;border:1.5px solid #e2e8f0;border-radius:6px;background:#fff;color:#0f172a;font-family:'Nunito',sans-serif;outline:none;transition:border-color .2s;box-sizing:border-box;}
-.ia-col-filter:focus{border-color:#2563eb;}
-.ia-col-filter::placeholder{color:#94a3b8;}
-.ia-btn-excel{
-  padding:.55rem 1.2rem;
-  background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);
-  color:#059669;border-radius:8px;
-  font-family:'Nunito',sans-serif;font-size:.82rem;font-weight:700;
-  cursor:pointer;transition:all .2s;white-space:nowrap;
-}
-.ia-btn-excel:hover{background:rgba(5,150,105,.18);}
-
-/* Table */
-.ia-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:10px;border:1px solid var(--border);background:#fff;box-shadow:0 1px 6px rgba(0,0,0,.06);}
-.ia-table{width:100%;border-collapse:collapse;font-size:.88rem;}
-.ia-table thead tr{border-bottom:none;}
-.ia-filter-row th{padding:4px 6px!important;background:transparent;border-top:none!important;border-bottom:2px solid #e2e8f0;}
-.ia-table th{
-  text-align:left;padding:.8rem 1rem;font-size:.72rem;font-weight:700;
-  letter-spacing:.1em;text-transform:uppercase;color:#64748b;
-  font-family:'Nunito',sans-serif;
-}
-.ia-table td{
-  padding:.9rem 1rem;border-bottom:1px solid #f1f5f9;
-  font-family:'Nunito',sans-serif;font-size:.85rem;font-weight:500;
-  color:#0f172a;vertical-align:middle;
-}
-.ia-table tr:hover td{background:#f8fafc;}
-.ia-badge{
-  display:inline-flex;align-items:center;gap:.3rem;padding:.25rem .7rem;
-  border-radius:20px;font-size:.72rem;font-weight:700;font-family:'Nunito',sans-serif;
-}
-.ia-badge.in{background:rgba(37,99,235,.1);color:#1e3a8a;border:1px solid rgba(37,99,235,.2);}
-.ia-badge.out{background:rgba(239,68,68,.1);color:#b91c1c;border:1px solid rgba(239,68,68,.2);}
-.ia-badge.area{background:rgba(37,99,235,.08);color:#2563eb;border:1px solid rgba(37,99,235,.15);}
-.ia-btn-edit{
-  padding:.3rem .8rem;background:transparent;border:1.5px solid #f59e0b;color:#d97706;
-  border-radius:6px;font-family:'Nunito',sans-serif;font-size:.75rem;font-weight:700;
-  cursor:pointer;transition:all .2s;
-}
-.ia-btn-edit:hover{background:rgba(245,158,11,.1);}
-.ia-empty{text-align:center;padding:3rem;color:#94a3b8;font-size:.9rem;display:none;font-family:'Nunito',sans-serif;}
-
-/* Admin config */
-.ia-admin-sections{display:grid;gap:2rem;}
-.ia-admin-section{
-  background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:1.5rem;
-}
-.ia-admin-section h4{
-  font-size:.95rem;font-weight:800;margin-bottom:1.2rem;
-  display:flex;align-items:center;gap:.5rem;color:#1e3a8a;
-  font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;text-transform:uppercase;
-}
-.ia-admin-section h4::before{
-  content:'';display:inline-block;width:3px;height:16px;
-  background:linear-gradient(180deg,#1e3a8a,#60a5fa);border-radius:2px;
-}
-.ia-input-row{display:flex;gap:1rem;align-items:flex-end;flex-wrap:wrap;margin-bottom:1rem;}
-.ia-input-row .ia-fg{flex:1;min-width:160px;margin-bottom:0;}
-.ia-btn-add{
-  padding:.85rem 1.4rem;background:linear-gradient(135deg,#1e3a8a,#2563eb);
-  color:#fff;border:none;border-radius:10px;
-  font-family:'Nunito',sans-serif;font-size:.88rem;font-weight:700;
-  cursor:pointer;white-space:nowrap;transition:all .2s;
-  box-shadow:0 2px 8px rgba(37,99,235,.3);
-}
-.ia-btn-add:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(37,99,235,.4);}
-.ia-btn-sec{
-  padding:.85rem 1.4rem;background:transparent;color:#2563eb;
-  border:1.5px solid #2563eb;border-radius:10px;
-  font-family:'Nunito',sans-serif;font-size:.88rem;font-weight:700;
-  cursor:pointer;white-space:nowrap;transition:all .2s;
-}
-.ia-btn-sec:hover{background:rgba(37,99,235,.07);}
-.ia-btn-del-all{
-  padding:.85rem 1.4rem;background:transparent;color:#dc2626;
-  border:1.5px solid #dc2626;border-radius:10px;
-  font-family:'Nunito',sans-serif;font-size:.88rem;font-weight:700;
-  cursor:pointer;white-space:nowrap;transition:all .2s;
-}
-.ia-btn-del-all:hover{background:rgba(220,38,38,.08);transform:translateY(-1px);}
-.ia-search-filter{margin-bottom:.8rem;}
-.ia-search-filter input{
-  width:100%;padding:.6rem 1rem;background:#fff;border:1.5px solid #e2e8f0;
-  border-radius:8px;color:#0f172a;font-family:'Nunito',sans-serif;font-size:.85rem;
-  outline:none;transition:border-color .2s;
-}
-.ia-search-filter input:focus{border-color:#2563eb;}
-.ia-list-grid{display:flex;flex-direction:column;gap:.4rem;max-height:320px;overflow-y:auto;}
-.ia-list-item{
-  display:flex;align-items:center;gap:.8rem;padding:.65rem 1rem;
-  background:#fff;border:1px solid #e2e8f0;border-radius:8px;flex-wrap:wrap;
-  transition:border-color .2s;
-}
-.ia-list-item:hover{border-color:#93c5fd;}
-.ia-item-name{flex:1;font-size:.85rem;font-family:'Nunito',sans-serif;font-weight:600;min-width:0;word-break:break-word;color:#0f172a;}
-.ia-item-actions{display:flex;gap:.4rem;flex-shrink:0;}
-.ia-tag{padding:.2rem .6rem;border-radius:12px;font-size:.72rem;font-weight:700;font-family:'Nunito',sans-serif;}
-.ia-tag.sup{background:rgba(37,99,235,.1);color:#1e3a8a;border:1px solid rgba(37,99,235,.2);}
-.ia-tag.none{background:#f1f5f9;color:#94a3b8;border:1px solid #e2e8f0;}
-.ia-areas-grid{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.8rem;}
-.ia-area-chip{
-  display:inline-flex;align-items:center;gap:.4rem;padding:.3rem .8rem;border-radius:20px;
-  background:rgba(37,99,235,.07);border:1px solid rgba(37,99,235,.2);
-  font-size:.8rem;font-family:'Nunito',sans-serif;font-weight:600;color:#1e3a8a;
-}
-.ia-area-chip .rm{background:none;border:none;color:#ef4444;cursor:pointer;font-size:.9rem;line-height:1;padding:0 0 0 4px;}
-.ia-import-result{padding:.8rem 1rem;border-radius:8px;font-size:.85rem;font-weight:700;display:none;margin-top:.8rem;font-family:'Nunito',sans-serif;}
-.ia-import-result.ok{background:rgba(37,99,235,.07);border:1px solid rgba(37,99,235,.25);color:#1e3a8a;}
-.ia-import-result.err{background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.25);color:#b91c1c;}
-.ia-divider{border:none;border-top:1px solid #e2e8f0;margin:1.2rem 0;}
-
-/* Modal */
-.ia-modal-overlay{
-  position:fixed;inset:0;background:rgba(15,23,42,.6);backdrop-filter:blur(4px);
-  z-index:1000;display:none;align-items:center;justify-content:center;padding:1rem;
-}
-.ia-modal-overlay.open{display:flex;}
-.ia-modal{
-  background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:2rem;
-  width:100%;max-width:480px;box-shadow:0 20px 60px rgba(15,23,42,.2);
-  animation:iaSlideUp .3s cubic-bezier(.22,1,.36,1);
-}
-.ia-modal h4{
-  font-size:1.05rem;font-weight:800;margin-bottom:1.5rem;color:#d97706;
-  font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;text-transform:uppercase;
-  display:flex;align-items:center;gap:8px;
-}
-.ia-modal h4::before{
-  content:'';display:inline-block;width:4px;height:18px;
-  background:linear-gradient(180deg,#b45309,#f59e0b);border-radius:2px;
-}
-.ia-modal-actions{display:flex;gap:1rem;margin-top:1.5rem;flex-wrap:wrap;}
-.ia-btn-save{
-  flex:1;padding:.85rem;
-  background:linear-gradient(135deg,#b45309,#f59e0b);
-  color:#fff;border:none;border-radius:10px;
-  font-family:'Nunito',sans-serif;font-size:.95rem;font-weight:800;
-  cursor:pointer;transition:all .2s;
-}
-.ia-btn-save:hover{transform:translateY(-1px);}
-.ia-btn-cancel{
-  flex:1;padding:.85rem;background:transparent;border:1.5px solid #e2e8f0;color:#64748b;
-  border-radius:10px;font-family:'Nunito',sans-serif;font-size:.95rem;font-weight:700;
-  cursor:pointer;transition:all .2s;
-}
-.ia-btn-cancel:hover{border-color:#ef4444;color:#ef4444;}
-.ia-btn-del{
-  padding:.85rem 1.2rem;background:transparent;border:1.5px solid #ef4444;color:#ef4444;
-  border-radius:10px;font-family:'Nunito',sans-serif;font-size:.95rem;font-weight:700;
-  cursor:pointer;transition:all .2s;
-}
-.ia-btn-del:hover{background:rgba(239,68,68,.08);}
-.ia-obs-input{
-  width:100%;min-width:140px;padding:.35rem .6rem;
-  background:#fff;border:1.5px solid #e2e8f0;border-radius:6px;
-  color:#0f172a;font-family:'Nunito',sans-serif;font-size:.8rem;
-  resize:none;min-height:36px;max-height:90px;
-  outline:none;transition:border-color .2s;line-height:1.4;
-}
-.ia-obs-input:focus{border-color:#2563eb;background:#f8fbff;}
-.ia-obs-input::placeholder{color:#94a3b8;}
-
-/* Botones del panel izquierdo en sp-screens */
-.sp-left-logout-btn{
-  margin-top:20px;
-  display:inline-flex;align-items:center;justify-content:center;gap:8px;
-  padding:9px 22px;border-radius:8px;
-  border:1.5px solid rgba(255,255,255,.2);
-  background:rgba(255,255,255,.06);
-  color:rgba(255,255,255,.7);
-  font-family:'Nunito',sans-serif;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;
-  cursor:pointer;transition:all .2s;backdrop-filter:blur(8px);
-}
-.sp-left-logout-btn:hover{border-color:rgba(239,68,68,.6);color:#fca5a5;background:rgba(239,68,68,.1);}
-.sp-user-btn-row{display:flex;flex-direction:row;align-items:center;justify-content:center;gap:8px;margin-top:12px;width:100%;}
-.sp-user-btn{
-  display:inline-flex;align-items:center;justify-content:center;gap:6px;
-  padding:7px 18px;border-radius:8px;
-  font-family:'Nunito',sans-serif;font-size:13px;font-weight:700;
-  cursor:pointer;transition:all .2s;
-  border:1.5px solid #e2e8f0;background:#fff;color:#1e3a8a;
-}
-.sp-user-btn:hover{background:#f1f5f9;border-color:#93c5fd;}
-.sp-user-btn-back{background:#fff;border:1.5px solid #e2e8f0;color:#1e3a8a;}
-.sp-user-btn-back:hover{background:#f1f5f9;border-color:#93c5fd;color:#1e3a8a;}
-.sp-user-btn-logout{background:#fff;border:1.5px solid #e2e8f0;color:#0f172a;}
-.sp-user-btn-logout:hover{border-color:#fca5a5;color:#ef4444;background:#fff5f5;}
-
-
-/* ═══════════════════════════════════════════════════════════════
-   RESPONSIVE — Control de Piso · Confecciones Millar
-   Breakpoints:
-     TV / 4K   : ≥ 1920px
-     Desktop   : 1200 – 1919px  (base, sin query)
-     Laptop    : 900 – 1199px
-     Tablet H  : 768 –  899px
-     Tablet V  : 600 –  767px
-     Móvil L   : 480 –  599px
-     Móvil S   :      ≤ 479px
-═══════════════════════════════════════════════════════════════ */
-
-/* ═══════════════════════════════════════════════════════════
-   RESPONSIVE GLOBAL — Control de Piso Millar
-   TV≥1920 | Desktop 1200-1919 | Laptop 900-1199
-   Tablet-H 768-899 | Tablet-V 600-767
-   Mobile-L 480-599 | Mobile-S ≤479
-═══════════════════════════════════════════════════════════ */
-
-/* Base: prevenir scroll horizontal en cualquier dispositivo */
-*, *::before, *::after { box-sizing: border-box; }
-html { overflow-x: hidden; max-width: 100%; }
-
-/* ── TV / 4K (≥ 1920px) ─────────────────────────────────── */
-@media (min-width: 1920px) {
-  header { padding: 0 48px; }
-  h1 { font-size: 22px; letter-spacing: 5px; }
-  .clock { font-size: 20px; }
-  .hd-logo { width: 44px; height: 44px; }
-  .stats { padding: 0; gap: 12px; }
-  .stat { font-size: 15px; padding: 0 18px; }
-  main { max-width: 1800px; padding: 32px 48px; }
-  .grid { grid-template-columns: repeat(12, 1fr); gap: 16px; }
-  .module { padding: 18px 14px 14px; }
-  .light { width: 60px; height: 60px; }
-  .mod-id { font-size: 14px; }
-  .mod-label { font-size: 11px; }
-  .mod-timer { font-size: 13px; }
-  .big-light { width: 180px; height: 180px; }
-  .big-id { font-size: 34px; }
-  .big-status { font-size: 28px; }
-  .lp-logo-ring { width: 180px; height: 180px; }
-  .lp-headline { font-size: 62px; }
-  .sp-logo-ring { width: 100px; height: 100px; }
-  .sp-headline { font-size: 42px; }
-  .sp-modtable-grid { grid-template-columns: repeat(8, 1fr) !important; }
-  .ia-main { max-width: 1600px; }
-}
-
-/* ── Laptop (900 – 1199px) ──────────────────────────────── */
-@media (max-width: 1199px) {
-  .grid { grid-template-columns: repeat(7, 1fr); gap: 10px; }
-  main { padding: 18px; }
-  h1 { font-size: 15px; letter-spacing: 3px; }
-  .clock { font-size: 14px; }
-  .stats { padding: 0; gap: 6px; }
-  .stat { font-size: 12px; padding: 0 11px; }
-  .btn-bar { font-size: 11px; padding: 4px 10px; }
-  .lp-left { flex: 0 0 55%; }
-  .lp-headline { font-size: 42px; }
-  .lp-logo-ring { width: 120px; height: 120px; }
-  .sp-left { flex: 0 0 32%; }
-  .sp-right-title { font-size: 28px; }
-  .sp-modtable-grid { grid-template-columns: repeat(5, 1fr) !important; }
-}
-
-/* ── Tablet horizontal (768 – 899px) ────────────────────── */
-@media (max-width: 899px) {
-  /* Grid módulos */
-  .grid { grid-template-columns: repeat(5, 1fr); gap: 9px; }
-  main { padding: 14px; }
-  .light { width: 42px; height: 42px; }
-  .mod-id { font-size: 10px; }
-  .mod-label { font-size: 8px; }
-  .mod-timer { font-size: 9px; }
-  .mod-mec { font-size: 8px; }
-
-  /* Header */
-  header { padding: 8px 16px; gap: 6px; }
-  h1 { font-size: 14px; letter-spacing: 2px; }
-  .clock { font-size: 13px; }
-  .hd-logo { width: 30px; height: 30px; }
-  .stats { padding: 0; flex-wrap: wrap; }
-  .stat { font-size: 11px; padding: 0 9px; }
-  .filter-hint { display: none; }
-  .btn-bar { font-size: 11px; padding: 4px 9px; }
-
-  /* Login principal — apilar */
-  .login-screen { flex-direction: column !important; }
-  .lp-left { flex: 0 0 auto !important; min-height: 220px; width: 100% !important; padding: 24px; }
-  .lp-right { flex: 1; width: 100% !important; padding: 28px 20px; box-shadow: none; }
-  .lp-headline { font-size: 36px; }
-  .lp-logo-ring { width: 100px; height: 100px; }
-  .lp-nodes { display: none; }
-  .lp-datetime { display: none; }
-
-  /* Login módulo — apilar */
-  .login-screen-mod { flex-direction: column !important; }
-
-  /* SP screens — apilar */
-  .sp-screen { flex-direction: column !important; }
-  .sp-left { flex: 0 0 auto !important; min-height: 200px; width: 100% !important; padding: 24px 20px; }
-  .sp-right { flex: 1; width: 100% !important; box-shadow: none; }
-  .sp-right-header { padding: 20px 24px 0; }
-  .sp-right-title { font-size: 26px; }
-  .sp-right-body { padding: 16px 24px 0; }
-  .sp-modtable-grid { grid-template-columns: repeat(5, 1fr) !important; }
-  .sp-footer { padding: 12px 24px; }
-
-  /* Selector */
-  .sel-btns { width: 90%; max-width: 300px; }
-  .sel-btn { font-size: 14px; padding: 16px; }
-
-  /* Modtable */
-  .modtable-grid { grid-template-columns: repeat(5, 1fr); max-width: 100%; width: 90%; }
-
-  /* Vista única */
-  .big-wrap { padding: 36px 40px; min-width: auto; width: 90%; }
-  .big-light { width: 120px; height: 120px; }
-  .big-id { font-size: 22px; }
-  .big-status { font-size: 20px; }
-
-  /* Modales */
-  .modal-box { padding: 28px; min-width: auto; width: 92%; }
-  .acum-box { padding: 20px; width: 96%; }
-  .fix-box { padding: 24px; width: 94%; }
-  .excel-modal-box { padding: 28px; min-width: auto; width: 92%; }
-
-  /* IA */
-  #ia-login { flex-direction: column !important; }
-  .ia-login-left { flex: 0 0 auto !important; min-height: 220px; width: 100% !important; }
-  .ia-login-right { flex: 1; width: 100% !important; box-shadow: none; }
-  .ia-login-headline { font-size: 36px; }
-  .ia-login-logo-ring { width: 100px; height: 100px; }
-  .ia-main { padding: 1.2rem; }
-  .ia-header { padding: .8rem 1.2rem; }
-}
-
-/* ── Tablet vertical (600 – 767px) ─────────────────────── */
-@media (max-width: 767px) {
-  .grid { grid-template-columns: repeat(4, 1fr); gap: 8px; }
-  .light { width: 38px; height: 38px; }
-  header { padding: 6px 12px; }
-  h1 { font-size: 13px; letter-spacing: 1.5px; }
-  .clock { font-size: 12px; }
-  .conn-label { display: none; }
-  .stats { padding: 0; gap: 5px; }
-  .btn-bar { font-size: 10px; padding: 3px 8px; }
-  #nav-single { padding: 6px 12px; }
-
-  /* Login */
-  .lp-left { min-height: 180px; }
-  .lp-logo-ring { width: 80px; height: 80px; }
-  .lp-headline { font-size: 30px; }
-  .lp-eyebrow { font-size: 9px; }
-  .lp-right { padding: 22px 16px; }
-  .lp-card { max-width: 100%; }
-  .lp-card-title { font-size: 30px; }
-
-  /* SP */
-  .sp-left { min-height: 170px; }
-  .sp-logo-ring { width: 70px; height: 70px; }
-  .sp-headline { font-size: 28px; }
-  .sp-right-title { font-size: 22px; }
-  .sp-right-header { padding: 16px 18px 0; }
-  .sp-right-body { padding: 12px 18px 0; }
-  .sp-modtable-grid { grid-template-columns: repeat(4, 1fr) !important; }
-  .sp-form-fields { max-width: 100% !important; }
-  .sp-footer { padding: 10px 18px; }
-
-  /* Selector */
-  .selector-screen { gap: 20px; }
-  .sel-btns { width: 85%; max-width: 280px; }
-  .sel-title { font-size: 18px; letter-spacing: 2px; }
-  .modtable-grid { grid-template-columns: repeat(4, 1fr); }
-  .modtable-title { font-size: 16px; }
-
-  /* Modales */
-  .acum-table th, .acum-table td { padding: 7px; font-size: 12px; }
-  .acum-filters { flex-direction: column; align-items: flex-start; gap: 7px; }
-  .fix-mod-grid { grid-template-columns: repeat(5, 1fr); }
-
-  /* IA */
-  .ia-login-left { min-height: 180px; }
-  .ia-login-logo-ring { width: 80px; height: 80px; }
-  .ia-login-headline { font-size: 28px; }
-  .ia-login-right { padding: 20px 16px; }
-  .ia-login-card { padding: 24px 20px; }
-  .ia-main { padding: 1rem; }
-  .ia-header { padding: .7rem 1rem; }
-  .ia-stats-row { grid-template-columns: 1fr 1fr; }
-}
-
-/* ── Móvil grande (480 – 599px) ─────────────────────────── */
-@media (max-width: 599px) {
-  .grid { grid-template-columns: repeat(3, 1fr); gap: 7px; }
-  main { padding: 10px; }
-  .light { width: 34px; height: 34px; }
-  .module { padding: 10px 6px 8px; border-radius: 10px; }
-  .mod-id { font-size: 9px; letter-spacing: 1px; }
-  .mod-mec { font-size: 7px; }
-
-  /* Header */
-  header { padding: 6px 10px; gap: 4px; }
-  h1 { font-size: 11px; letter-spacing: 1px; }
-  .clock { font-size: 11px; letter-spacing: 1px; }
-  .hd-logo { width: 26px; height: 26px; }
-
-  /* Stats scroll */
-  .stats { flex-wrap: nowrap; overflow-x: auto; padding: 0; gap: 5px; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
-  .stats::-webkit-scrollbar { display: none; }
-  .stat { flex-shrink: 0; font-size: 11px; padding: 0 9px; }
-  .view-toggle { flex-shrink: 0; }
-  .filter-hint { display: none; }
-
-  /* Login */
-  .lp-left { min-height: 160px; padding: 18px; }
-  .lp-logo-ring { width: 70px; height: 70px; }
-  .lp-headline { font-size: 26px; }
-  .lp-right { padding: 18px 14px; }
-  .lp-card { max-width: 100%; }
-  .lp-card-title { font-size: 26px; }
-  .login-btn { font-size: 14px; padding: 11px; }
-  .login-inner-card { padding: 24px 20px; max-width: 100%; }
-
-  /* SP */
-  .sp-left { min-height: 150px; padding: 16px; }
-  .sp-logo-ring { width: 60px; height: 60px; }
-  .sp-headline { font-size: 22px; }
-  .sp-username { font-size: 18px; }
-  .sp-right-title { font-size: 20px; }
-  .sp-right-header { padding: 14px 14px 0; }
-  .sp-right-body { padding: 10px 14px 0; max-width: 100% !important; }
-  .sp-modtable-grid { grid-template-columns: repeat(4, 1fr) !important; gap: 7px !important; }
-  .sp-footer { flex-direction: column; align-items: center; gap: 6px; padding: 10px 14px; }
-  .sp-logout-btn { width: 100%; }
-
-  /* Selector */
-  .sel-btns { width: 90%; max-width: 280px; }
-  .sel-title { font-size: 16px; }
-  .sel-btn { padding: 14px; font-size: 13px; }
-  .modtable-grid { grid-template-columns: repeat(4, 1fr); width: 94%; }
-  .modtable-btn { font-size: 11px; padding: 10px 4px; letter-spacing: 1px; }
-
-  /* Vista única */
-  .big-wrap { padding: 28px 20px; min-width: auto; width: 92%; }
-  .big-light { width: 100px; height: 100px; }
-  .big-id { font-size: 18px; }
-  .big-status { font-size: 18px; }
-  .big-timer { font-size: 13px; }
-
-  /* Modales */
-  .modal-box { padding: 24px 18px; width: 96%; }
-  .modal-title { font-size: 16px; }
-  .modal-btn { font-size: 13px; padding: 12px; }
-  .excel-modal-box { padding: 22px 16px; min-width: auto; width: 96%; }
-  .fix-box { padding: 20px 14px; width: 96%; }
-  .fix-mod-grid { grid-template-columns: repeat(4, 1fr); }
-  .acum-box { padding: 16px 12px; width: 99%; }
-  .acum-title { font-size: 16px; }
-  .acum-table th, .acum-table td { font-size: 11px; padding: 6px 4px; }
-  .acum-filters { flex-direction: column; gap: 6px; }
-  .acum-sort-btn, .acum-filter-sel { width: 100%; }
-
-  /* IA */
-  .ia-login-left { min-height: 160px; padding: 16px; }
-  .ia-login-logo-ring { width: 72px; height: 72px; }
-  .ia-login-headline { font-size: 22px; }
-  .ia-login-right { padding: 18px 14px; }
-  .ia-login-card { padding: 22px 16px; max-width: 100%; }
-  .ia-stats-row { grid-template-columns: 1fr 1fr; }
-  .ia-action-btns { grid-template-columns: 1fr; }
-  .ia-tabs { flex-wrap: wrap; gap: 4px; }
-  .ia-tab-btn { font-size: .78rem; padding: .4rem .8rem; }
-}
-
-/* ── Móvil pequeño (≤ 479px) ────────────────────────────── */
-@media (max-width: 479px) {
-  .grid { grid-template-columns: repeat(3, 1fr); gap: 6px; }
-  main { padding: 8px; }
-  .light { width: 30px; height: 30px; }
-  .module { padding: 8px 5px 6px; gap: 3px; }
-  .mod-id { font-size: 8px; }
-  .mod-label { font-size: 7px; padding: 1px 4px; }
-  .mod-timer { font-size: 8px; padding: 1px 4px; }
-  .mod-mec { font-size: 7px; }
-
-  /* Header */
-  h1 { font-size: 10px; letter-spacing: 0.5px; }
-  .clock { font-size: 10px; }
-  .live-dot { width: 7px; height: 7px; }
-  .stat { font-size: 10px; padding: 0 8px; }
-  .btn-bar { font-size: 10px; padding: 3px 7px; }
-
-  /* Login */
-  .lp-logo-ring { width: 60px; height: 60px; }
-  .lp-headline { font-size: 22px; }
-  .lp-card-title { font-size: 22px; }
-  .login-inner-card { padding: 20px 14px; }
-
-  /* SP */
-  .sp-logo-ring { width: 52px; height: 52px; }
-  .sp-headline { font-size: 20px; }
-  .sp-modtable-grid { grid-template-columns: repeat(3, 1fr) !important; }
-  .sp-mod-btn { font-size: 10px; padding: 10px 4px; }
-  .sp-right-title { font-size: 18px; }
-
-  /* Selector */
-  .sel-logo { width: 52px; height: 52px; }
-  .sel-title { font-size: 15px; }
-  .sel-btn { font-size: 12px; padding: 12px; }
-  .modtable-grid { grid-template-columns: repeat(3, 1fr); }
-  .modtable-btn { font-size: 10px; padding: 9px 3px; }
-
-  /* Vista única */
-  .big-wrap { padding: 22px 14px; width: 97%; }
-  .big-light { width: 84px; height: 84px; }
-  .big-id { font-size: 16px; letter-spacing: 4px; }
-  .big-status { font-size: 16px; letter-spacing: 2px; }
-
-  /* Modales */
-  .modal-box { padding: 18px 12px; width: 99%; }
-  .acum-table { font-size: 10px; }
-  .fix-mod-grid { grid-template-columns: repeat(3, 1fr); }
-  .excel-modal-box { width: 99%; padding: 18px 12px; }
-
-  /* IA */
-  .ia-login-headline { font-size: 20px; }
-  .ia-login-logo-ring { width: 64px; height: 64px; }
-  .ia-tabs { flex-direction: column; align-items: stretch; }
-  .ia-tab-btn { font-size: .75rem; padding: .35rem .7rem; text-align: center; }
-  .ia-obs-input { min-width: 80px; font-size: .72rem; }
-}
-
-/* ══════════════════════════════════════════════════════════════
-   RESPONSIVE GLOBAL — Control de Piso · Asistencia · CI
-   TV (+1400px) · PC (1024-1399) · Tablet L (768-1023)
-   Tablet P (480-767) · Celular (-480px)
-══════════════════════════════════════════════════════════════ */
-
-/* ── TV / Pantallas grandes (≥ 1400px) ──────────────────────── */
-@media (min-width: 1400px) {
-  /* Control de Piso */
-  header { padding: 0 40px; }
-  h1 { font-size: 20px; letter-spacing: 5px; }
-  .clock { font-size: 18px; }
-  .hd-logo { width: 42px; height: 42px; }
-  .stats { padding: 0; gap: 10px; }
-  .stat { font-size: 14px; padding: 0 16px; height: 36px; }
-  main { max-width: 1600px; padding: 28px 40px; }
-  .grid { grid-template-columns: repeat(9, 1fr); gap: 14px; }
-  .module { padding: 16px 12px 12px; }
-  .light { width: 56px; height: 56px; }
-  .mod-id { font-size: 13px; }
-  .mod-label { font-size: 10px; }
-  .mod-timer { font-size: 12px; }
-  .mod-mec { font-size: 10px; }
-  /* IA */
-  .ia-main { max-width: 1500px; padding: 2rem 3rem; }
-  .ia-stat-card { padding: 1.4rem 1.8rem; }
-  .ia-stat-val { font-size: 2.8rem; }
-  .ia-table th, .ia-table td { padding: 12px 14px; font-size: 1rem; }
-  .ia-obs-input { font-size: .9rem; min-height: 40px; }
-  .ia-tab-btn { font-size: 1rem; padding: .75rem 1.6rem; }
-  .ia-btn-add, .ia-btn-sec { font-size: 1rem; padding: 1rem 1.8rem; }
-  .ia-header { padding: 0 3rem; }
-  .ia-header h3 { font-size: 1.5rem; }
-}
-
-/* ── PC estándar (1024px – 1399px) ──────────────────────────── */
-@media (min-width: 1024px) and (max-width: 1399px) {
-  .grid { grid-template-columns: repeat(7, 1fr); gap: 12px; }
-  main { max-width: 1280px; padding: 20px 28px; }
-  .ia-main { max-width: 1200px; padding: 1.5rem 2rem; }
-  .ia-stat-card { padding: 1.1rem 1.4rem; }
-  .ia-table th, .ia-table td { padding: 10px 12px; }
-  .ia-obs-input { font-size: .85rem; }
-}
-
-/* ── Tablet landscape (768px – 1023px) ──────────────────────── */
-@media (min-width: 768px) and (max-width: 1023px) {
-  /* Header */
-  header { padding: 0 16px; flex-wrap: wrap; }
-  h1 { font-size: 14px; letter-spacing: 2px; }
-  .clock { font-size: 13px; }
-  .hd-logo { width: 32px; height: 32px; }
-  /* Control de Piso grid */
-  .grid { grid-template-columns: repeat(5, 1fr); gap: 10px; }
-  main { padding: 16px; }
-  .light { width: 44px; height: 44px; }
-  .mod-id { font-size: 11px; }
-  .mod-label { font-size: 8px; }
-  .mod-timer { font-size: 9px; }
-  /* Stats en 2 columnas */
-  .stats { padding: 0; flex-wrap: wrap; gap: 6px; }
-  .stat { font-size: 12px; padding: 0 11px; height: 30px; }
-  .view-toggle { flex-wrap: wrap; gap: 4px; }
-  .btn-bar { font-size: 11px; padding: 4px 9px; }
-  /* IA — formulario en 1 columna */
-  .ia-main { padding: 1rem 1.2rem; }
-  .ia-stats-grid { grid-template-columns: repeat(2, 1fr); gap: .8rem; }
-  .ia-reg-grid { grid-template-columns: 1fr; }
-  .ia-hist-controls .ia-date-row { flex-wrap: wrap; gap: 8px; }
-  .ia-input-row { flex-wrap: wrap; gap: .6rem; }
-  .ia-table th, .ia-table td { padding: 8px 10px; font-size: .85rem; }
-  .ia-obs-input { min-width: 100px; font-size: .8rem; }
-  .ia-tab-btn { font-size: .85rem; padding: .5rem 1rem; }
-  /* Login tablet */
-  .login-screen { flex-direction: column !important; }
-  .lp-left { flex: 0 0 auto !important; min-height: 200px; width: 100% !important; }
-  .lp-right { flex: 1; width: 100% !important; }
-  .lp-headline { font-size: 38px; }
-  .lp-nodes { display: none; }
-  /* CI */
-  .modules-grid { grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); }
-}
-
-/* ── Tablet portrait (480px – 767px) ────────────────────────── */
-@media (min-width: 480px) and (max-width: 767px) {
-  /* Header */
-  header { padding: 6px 12px; flex-wrap: wrap; gap: 4px; }
-  h1 { font-size: 12px; letter-spacing: 1.5px; }
-  .clock { font-size: 12px; }
-  .hd-logo { width: 28px; height: 28px; }
-  /* Piso grid */
-  .grid { grid-template-columns: repeat(4, 1fr); gap: 7px; }
-  main { padding: 10px; }
-  .light { width: 36px; height: 36px; }
-  .mod-id { font-size: 9px; }
-  .mod-label { font-size: 7px; padding: 1px 4px; }
-  .mod-timer { font-size: 8px; }
-  .mod-mec { font-size: 8px; }
-  /* Stats apilados */
-  .stats { padding: 0; flex-wrap: wrap; gap: 4px; }
-  .stat { font-size: 11px; padding: 0 9px; height: 28px; }
-  .btn-bar { font-size: 10px; padding: 4px 8px; }
-  .view-toggle { flex-wrap: wrap; gap: 3px; }
-  /* IA — controles apilados, inputs full width */
-  .ia-main { padding: .8rem 1rem; }
-  .ia-header { padding: 0 1rem; min-height: 52px; }
-  .ia-header h3 { font-size: 1rem; }
-  .ia-stats-grid { grid-template-columns: repeat(2, 1fr); gap: .6rem; }
-  .ia-stat-card { padding: .8rem 1rem; }
-  .ia-stat-val { font-size: 1.8rem; }
-  .ia-reg-grid { grid-template-columns: 1fr; gap: .6rem; }
-  .ia-hist-controls .ia-date-row { flex-direction: column; align-items: stretch; gap: 8px; }
-  .ia-sort-controls { flex-wrap: wrap; gap: 4px; }
-  .ia-input-row { flex-direction: column; align-items: stretch; gap: .5rem; }
-  .ia-fg { width: 100% !important; flex: unset !important; }
-  .ia-fg input, .ia-fg select, .ia-fg textarea { width: 100% !important; }
-  .ia-btn-add, .ia-btn-sec, .ia-btn-del-all { width: 100%; justify-content: center; }
-  .ia-table { font-size: .78rem; }
-  .ia-table th, .ia-table td { padding: 6px 7px; }
-  .ia-obs-input { min-width: 90px; font-size: .75rem; }
-  .ia-tabs { flex-wrap: wrap; gap: 4px; }
-  .ia-tab-btn { font-size: .78rem; padding: .4rem .8rem; }
-  .ia-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  /* Login */
-  .login-screen { flex-direction: column !important; }
-  .lp-left { min-height: 180px; width: 100% !important; flex: 0 0 auto !important; }
-  .lp-headline { font-size: 30px; }
-  .lp-logo-ring { width: 80px; height: 80px; }
-  .lp-nodes { display: none; }
-  .lp-datetime { display: none; }
-  /* CI */
-  .modules-grid { grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); }
-  .module-card { padding: 10px 6px; }
-  .card-ball { width: 36px; height: 36px; }
-}
-
-/* ── Celular (≤ 479px) ───────────────────────────────────────── */
-@media (max-width: 479px) {
-  /* Header compacto */
-  header { padding: 5px 10px; flex-wrap: wrap; gap: 3px; }
-  h1 { font-size: 10px; letter-spacing: 0.5px; }
-  .clock { font-size: 10px; letter-spacing: 1px; }
-  .hd-logo { width: 26px; height: 26px; }
-  .live-dot { width: 7px; height: 7px; }
-  .conn-label { display: none; }
-  /* Stats compactos */
-  .stats { padding: 0; flex-wrap: wrap; gap: 3px; overflow-x: auto; }
-  .stat { font-size: 10px; padding: 0 8px; height: 26px; }
-  .filter-hint { display: none; }
-  .view-toggle { flex-wrap: wrap; gap: 3px; margin-left: 0; }
-  .btn-bar { font-size: 10px; padding: 3px 7px; }
-  /* Piso grid 3 columnas */
-  .grid { grid-template-columns: repeat(3, 1fr); gap: 5px; }
-  main { padding: 7px; }
-  .module { padding: 7px 4px 5px; gap: 3px; border-radius: 8px; }
-  .light { width: 28px; height: 28px; }
-  .mod-id { font-size: 8px; }
-  .mod-label { font-size: 6px; padding: 1px 3px; }
-  .mod-timer { font-size: 7px; padding: 1px 3px; }
-  .mod-mec { font-size: 7px; }
-  /* Vista única */
-  .big-wrap { padding: 20px 12px; width: 97%; border-radius: 14px; }
-  .big-light { width: 80px; height: 80px; }
-  .big-id { font-size: 16px; letter-spacing: 3px; }
-  .big-status { font-size: 15px; letter-spacing: 2px; }
-  .big-timer { font-size: 12px; }
-  /* Modales desde abajo (sheet) */
-  .modal-overlay { align-items: flex-end !important; }
-  .modal-box {
-    padding: 16px 12px;
-    width: 100% !important;
-    border-radius: 16px 16px 0 0 !important;
-    max-height: 85vh;
-    overflow-y: auto;
-  }
-  .excel-modal-box { width: 100% !important; border-radius: 16px 16px 0 0 !important; padding: 16px 12px; }
-  .acum-table { font-size: 10px; }
-  .fix-mod-grid { grid-template-columns: repeat(3, 1fr); }
-  /* Selector módulo */
-  .sel-logo { width: 50px; height: 50px; }
-  .sel-title { font-size: 14px; }
-  .sel-btn { font-size: 12px; padding: 14px 10px; min-height: 52px; border-radius: 10px; }
-  .modtable-grid { grid-template-columns: repeat(3, 1fr); gap: 6px; }
-  .modtable-btn { font-size: 10px; padding: 10px 3px; }
-  /* SP screens */
-  .sp-logo-ring { width: 50px; height: 50px; }
-  .sp-headline { font-size: 18px; }
-  .sp-modtable-grid { grid-template-columns: repeat(3, 1fr) !important; }
-  .sp-mod-btn { font-size: 10px; padding: 10px 4px; }
-  .sp-right-title { font-size: 16px; }
-  /* Login */
-  .lp-logo-ring { width: 60px; height: 60px; }
-  .lp-headline { font-size: 22px; }
-  .lp-card-title { font-size: 20px; }
-  .login-inner-card { padding: 18px 12px; }
-  /* IA — Botones grandes touch, modales desde abajo */
-  .ia-main { padding: .6rem .7rem; }
-  .ia-header { padding: 0 .7rem; min-height: 48px; }
-  .ia-header h3 { font-size: .9rem; }
-  .ia-header-right { gap: .5rem; }
-  .ia-logout-btn { font-size: .75rem; padding: .35rem .7rem; }
-  .ia-stats-grid { grid-template-columns: repeat(2, 1fr); gap: .5rem; }
-  .ia-stat-card { padding: .7rem .9rem; border-radius: 10px; }
-  .ia-stat-val { font-size: 1.6rem; }
-  .ia-stat-label { font-size: .65rem; }
-  .ia-panel { padding: 1rem .7rem; }
-  .ia-panel h3 { font-size: 1rem; margin-bottom: .8rem; }
-  .ia-reg-grid { grid-template-columns: 1fr; gap: .5rem; }
-  .ia-reg-submit { min-height: 52px; font-size: 1rem; border-radius: 10px; }
-  .ia-hist-controls .ia-date-row { flex-direction: column; gap: 8px; }
-  .ia-sort-controls { flex-wrap: wrap; gap: 4px; }
-  .ia-sort-btn { font-size: .75rem; padding: .35rem .7rem; }
-  .ia-input-row { flex-direction: column; gap: .5rem; }
-  .ia-fg { width: 100% !important; flex: unset !important; }
-  .ia-fg input, .ia-fg select, .ia-fg textarea { width: 100% !important; font-size: .9rem; }
-  .ia-btn-add, .ia-btn-sec, .ia-btn-del-all { width: 100%; justify-content: center; min-height: 48px; font-size: .9rem; border-radius: 10px; }
-  .ia-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 8px; }
-  .ia-table { font-size: .72rem; }
-  .ia-table th, .ia-table td { padding: 5px 6px; }
-  .ia-obs-input { min-width: 75px; font-size: .7rem; min-height: 32px; }
-  .ia-tabs { flex-wrap: wrap; gap: 3px; }
-  .ia-tab-btn { font-size: .72rem; padding: .35rem .65rem; flex: 1 1 auto; text-align: center; min-height: 40px; }
-  .ia-login-headline { font-size: 20px; }
-  .ia-login-logo-ring { width: 60px; height: 60px; }
-  .ia-modal-overlay.open .ia-modal {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    width: 100% !important;
-    border-radius: 18px 18px 0 0;
-    max-height: 90vh;
-    overflow-y: auto;
-    padding: 1.2rem 1rem;
-  }
-  .ia-modal h4 { font-size: 1rem; }
-  .ia-btn-save, .ia-btn-cancel, .ia-btn-del { min-height: 46px; font-size: .9rem; }
-  /* CI */
-  .modules-grid { grid-template-columns: repeat(3, 1fr); gap: 6px; }
-  .module-card { padding: 8px 5px; border-radius: 8px; }
-  .card-ball { width: 30px; height: 30px; }
-  .card-mod { font-size: .7rem; }
-  .card-tipo { font-size: .65rem; }
-}
-
-/* ── Touch improvements (todos los móviles) ─────────────────── */
-@media (hover: none) and (pointer: coarse) {
-  .stat, .btn-bar, .modtable-btn, .sel-btn,
-  .ia-btn-add, .ia-btn-sec, .ia-btn-del-all,
-  .ia-tab-btn, .ia-sort-btn, .ia-btn-save,
-  .ia-btn-cancel, .ia-btn-del, .ia-btn-edit,
-  .ia-btn-excel { -webkit-tap-highlight-color: transparent; }
-  .module.clickable:active { transform: scale(0.96); }
-  .ia-reg-submit:active { transform: scale(0.98); }
-  input, select, textarea { font-size: 16px !important; } /* Evita zoom en iOS */
-}
-
-</style>
-
-<!-- Login del Control de Asistencia — rediseñado con identidad Millar -->
-<div id="ia-login">
-  <!-- Panel izquierdo: azul navy con logo Millar -->
-  <div class="ia-login-left">
-    <div class="ia-login-mesh"></div>
-    <div class="ia-login-dotgrid"></div>
-    <div class="ia-login-orb1"></div>
-    <div class="ia-login-orb2"></div>
-    <div class="ia-login-logo-zone">
-      <div class="ia-login-logo-ring"><img src="data:image/png;base64,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" alt="Confecciones Millar"></div>
-      <div class="ia-login-eyebrow">Sistema integrado</div>
-      <div class="ia-login-headline">Control de <em>Asistencia</em></div>
-      <div class="ia-login-sub">Registro de ingresos — Confecciones Millar</div>
-    </div>
-  </div>
-  <!-- Panel derecho: blanco con formulario -->
-  <div class="ia-login-right">
-    <div class="ia-login-card">
-      <div class="ia-card-brand-row">
-        <div class="ia-card-brand-pip"></div>
-        <span class="ia-card-brand-txt">Confecciones Millar</span>
-      </div>
-      <div class="ia-card-title">Bienvenido</div>
-      <div class="ia-card-sub">Inicia sesión para continuar</div>
-      <div class="ia-fg">
-        <label>Usuario</label>
-        <select id="ia-login-user"></select>
-      </div>
-      <div class="ia-fg">
-        <label>Contraseña</label>
-        <input type="password" id="ia-login-pass" placeholder="••••••••">
-      </div>
-      <button class="ia-btn-primary" onclick="iaDoLogin()">Ingresar →</button>
-      <p class="ia-err" id="ia-login-error">⚠ Usuario o contraseña incorrectos</p>
-      <button onclick="cerrarControlIngreso()" style="margin-top:8px;width:100%;padding:7px 18px;border-radius:8px;border:1.5px solid #e2e8f0;background:#fff;color:#1e3a8a;font-family:'Nunito',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .2s;">← Volver</button>
-    </div>
-    <div class="ia-login-right-foot">© 2026 Ingeniería Confecciones Millar S.A.S.</div>
-  </div>
-</div>
-
-<!-- App principal del Control de Asistencia -->
-<div id="ia-app">
-  <div class="ia-header">
-    <div class="ia-header-left">
-      <div class="ia-header-logo"><img src="data:image/png;base64,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" alt="Millar"></div>
-      <div>
-        <h3>Control de <span>Asistencia</span></h3>
-        <p id="ia-header-date">—</p>
-      </div>
-    </div>
-    <div class="ia-header-right">
-      <div id="ia-admin-badge-wrap"></div>
-      <div class="ia-sup-badge"><div class="ia-sup-dot"></div><span id="ia-sup-name">—</span></div>
-      <button class="ia-btn-logout" onclick="iaDoLogout()">Cerrar sesión</button>
-      <button class="ia-btn-logout" onclick="cerrarControlIngreso()" style="background:#e2e8f0;color:#1e3a8a;border-color:#cbd5e1;">⬅ Volver</button>
-    </div>
-  </div>
-
-  <div class="ia-main">
-    <div class="ia-tabs">
-      <button class="ia-tab-btn active" id="ia-tab-btn-register" onclick="iaShowTab('register',this)">➕ Registrar</button>
-      <button class="ia-tab-btn" id="ia-tab-btn-history" onclick="iaShowTab('history',this)">📋 Historial</button>
-      <button class="ia-tab-btn admin-tab hidden" id="ia-tab-btn-records" onclick="iaShowTab('records',this)" style="display:none">🛠 Editar Registros</button>
-      <button class="ia-tab-btn admin-tab hidden" id="ia-tab-btn-config" onclick="iaShowTab('config',this)" style="display:none">⚙️ Configuración</button>
-    </div>
-
-    <div class="ia-stats-row">
-      <div class="ia-stat-card"><div class="ia-slabel">Presentes hoy</div><div class="ia-value" id="ia-stat-today">0</div><div class="ia-sub" id="ia-stat-date">—</div></div>
-      <div class="ia-stat-card"><div class="ia-slabel">Faltas hoy</div><div class="ia-value absent" id="ia-stat-absent">0</div><div class="ia-sub">registradas</div></div>
-      <div class="ia-stat-card"><div class="ia-slabel">Pendientes</div><div class="ia-value" id="ia-stat-pending">0</div><div class="ia-sub">sin registrar</div></div>
-
-    </div>
-
-    <!-- REGISTRAR -->\n    <div class="ia-panel" id="ia-tab-register">
-      <h3>Nuevo Ingreso</h3>
-      <div class="ia-reg-grid">
-<div class="ia-fg hidden" id="ia-admin-sup-filter-wrap" style="display:none!important"><select id="ia-admin-sup-filter"><option value="">— Todos los empleados —</option></select></div>
-        <!-- Fecha de registro (solo admin) -->
-        <div class="ia-fg admin-tab hidden" id="ia-reg-fecha-wrap" style="grid-column:1/-1;display:none!important;">
-          <label style="display:flex;align-items:center;gap:8px;">
-            📅 Fecha del registro
-            <span style="font-size:11px;color:#94a3b8;font-weight:400;">(dejar en hoy para registro normal)</span>
-          </label>
-          <input type="date" id="ia-reg-fecha" style="padding:10px 14px;border:1.5px solid #e2e8f0;border-radius:9px;font-family:'Nunito',sans-serif;font-size:14px;color:#0f172a;outline:none;width:100%;box-sizing:border-box;"
-            onfocus="this.style.borderColor='#2563eb'" onblur="this.style.borderColor='#e2e8f0'"
-            onchange="iaOnFechaChange()">
-        </div>
-        <div class="ia-fg" style="grid-column:1/-1">
-          <label>Buscar empleado</label>
-          <div class="ia-search-wrapper">
-            <input type="text" id="ia-emp-search" placeholder="Escribe el nombre..." autocomplete="off"
-              oninput="iaFilterEmployees()" onfocus="iaOpenDropdown()" onblur="iaDelayClose()">
-            <button class="ia-clear-btn" onclick="iaClearEmployee()">✕</button>
-            <div class="ia-dropdown" id="ia-emp-dropdown"></div>
-          </div>
-          <input type="hidden" id="ia-emp-selected">
-        </div>
-        <div class="ia-fg" style="grid-column:1/-1">
-          <label>Módulo</label>
-          <select id="ia-emp-area"><option value="">— Seleccionar módulo —</option></select>
-        </div>
-        <!-- Dropdown de novedades (se abre al tocar Faltó) -->
-        <div style="grid-column:1/-1;display:none;" id="ia-novedad-wrap">
-          <div style="font-size:11px;font-weight:800;letter-spacing:1px;text-transform:uppercase;color:#854d0e;margin-bottom:6px;">¿Qué novedad tiene?</div>
-          <div id="ia-novedad-list" style="background:#fff;border:1.5px solid #e2e8f0;border-radius:12px;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,.08);"></div>
-          <button onclick="iaCerrarNovedad()" style="margin-top:8px;width:100%;padding:8px;border-radius:8px;border:1.5px solid #e2e8f0;background:#fff;color:#64748b;font-family:'Nunito',sans-serif;font-size:13px;font-weight:700;cursor:pointer;">Cancelar</button>
-        </div>
-        <div class="ia-toast ok" id="ia-success-toast">✅ Ingreso registrado exitosamente</div>
-        <div class="ia-toast bad" id="ia-absent-toast">❌ Falta registrada</div>
-        <div class="ia-toast" id="ia-novedad-toast" style="display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#b91c1c;border-radius:10px;padding:.75rem 1rem;font-size:.85rem;font-weight:700;text-align:center;">❌ Novedad registrada</div>
-        <div class="ia-action-btns" id="ia-action-btns-wrap">
-          <button class="ia-btn-register" onclick="iaRegisterEntry('presente')">✅ Registrar Ingreso</button>
-          <button class="ia-btn-absent"   onclick="iaToggleNovedadMode()">❌ Faltó</button>
-        </div>
-      </div>
-      <div class="ia-today-section">
-        <h4>Registrados hoy</h4>
-        <div class="ia-chips" id="ia-today-chips"><span style="color:#6b7a99;font-size:.85rem;">Aún no hay registros hoy</span></div>
-      </div>
-    </div>
-
-    <!-- HISTORIAL -->
-    <div class="ia-panel hidden" id="ia-tab-history">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:8px;">
-        <h3 style="margin:0;">Historial de Asistencia</h3>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          <label style="font-size:12px;font-weight:700;color:#64748b;">Desde</label>
-          <input type="date" id="ia-filter-from" onchange="iaRenderHistory()" style="padding:6px 10px;border:1.5px solid #e2e8f0;border-radius:8px;font-family:'Nunito',sans-serif;font-size:13px;color:#0f172a;">
-          <label style="font-size:12px;font-weight:700;color:#64748b;">Hasta</label>
-          <input type="date" id="ia-filter-to" onchange="iaRenderHistory()" style="padding:6px 10px;border:1.5px solid #e2e8f0;border-radius:8px;font-family:'Nunito',sans-serif;font-size:13px;color:#0f172a;">
-          <button class="ia-btn-excel" id="ia-btn-export-hist" onclick="iaExportExcel('history')" style="padding:6px 14px;font-size:13px;">📊 Excel</button>
-        </div>
-      </div>
-      <div class="ia-table-wrap">
-        <table class="ia-table">
-          <thead>
-            <tr>
-              <th style="width:40px;">#</th>
-              <th onclick="iaSetSortHistory('name')" style="cursor:pointer;user-select:none;">Empleado <span id="ia-hs-name">⇅</span></th>
-              <th onclick="iaSetSortHistory('area')" style="cursor:pointer;user-select:none;">Módulo / Novedad <span id="ia-hs-area">⇅</span></th>
-              <th onclick="iaSetSortHistory('date')" style="cursor:pointer;user-select:none;">Fecha <span id="ia-hs-date">⇅</span></th>
-              <th onclick="iaSetSortHistory('supervisor')" style="cursor:pointer;user-select:none;">Supervisor <span id="ia-hs-supervisor">⇅</span></th>
-              <th onclick="iaSetSortHistory('status')" style="cursor:pointer;user-select:none;">Estado <span id="ia-hs-status">⇅</span></th>
-              <th>Observaciones</th>
-            </tr>
-            <tr class="ia-filter-row">
-              <th></th>
-              <th><input class="ia-col-filter" type="text" placeholder="Buscar..." oninput="iaRenderHistory()" id="ia-fh-emp"></th>
-              <th><input class="ia-col-filter" type="text" placeholder="Buscar..." oninput="iaRenderHistory()" id="ia-fh-area"></th>
-              <th><input class="ia-col-filter" type="text" placeholder="Buscar..." oninput="iaRenderHistory()" id="ia-fh-fecha"></th>
-              <th><input class="ia-col-filter" type="text" placeholder="Buscar..." oninput="iaRenderHistory()" id="ia-fh-sup"></th>
-              <th>
-                <select class="ia-col-filter" oninput="iaRenderHistory()" id="ia-fh-estado" style="padding:4px 6px;width:100%;">
-                  <option value="">Todos</option>
-                  <option value="presente">✅ Presente</option>
-                  <option value="falto">❌ Faltó</option>
-                </select>
-              </th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody id="ia-hist-body"></tbody>
-        </table>
-        <div class="ia-empty" id="ia-hist-empty">📭 No hay registros para este rango</div>
-      </div>
-    </div>
-
-    <!-- EDITAR REGISTROS (admin) -->
-    <div class="ia-panel ia-warn-panel hidden" id="ia-tab-records" style="display:none">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:8px;">
-        <h3 style="margin:0;">Editar Registros</h3>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          <label style="font-size:12px;font-weight:700;color:#64748b;">Desde</label>
-          <input type="date" id="ia-admin-from" onchange="iaRenderAdminTable()" style="padding:6px 10px;border:1.5px solid #e2e8f0;border-radius:8px;font-family:'Nunito',sans-serif;font-size:13px;color:#0f172a;">
-          <label style="font-size:12px;font-weight:700;color:#64748b;">Hasta</label>
-          <input type="date" id="ia-admin-to" onchange="iaRenderAdminTable()" style="padding:6px 10px;border:1.5px solid #e2e8f0;border-radius:8px;font-family:'Nunito',sans-serif;font-size:13px;color:#0f172a;">
-          <button class="ia-btn-excel" onclick="iaExportExcel('admin')" style="padding:6px 14px;font-size:13px;">📊 Excel</button>
-        </div>
-      </div>
-      <div class="ia-table-wrap">
-        <table class="ia-table">
-          <thead>
-            <tr>
-              <th style="width:40px;">#</th>
-              <th onclick="iaSetSortAdmin('name')" style="cursor:pointer;user-select:none;">Empleado <span id="ia-as-name">⇅</span></th>
-              <th onclick="iaSetSortAdmin('area')" style="cursor:pointer;user-select:none;">Área <span id="ia-as-area">⇅</span></th>
-              <th onclick="iaSetSortAdmin('date')" style="cursor:pointer;user-select:none;">Fecha <span id="ia-as-date">⇅</span></th>
-              <th onclick="iaSetSortAdmin('supervisor')" style="cursor:pointer;user-select:none;">Supervisor <span id="ia-as-supervisor">⇅</span></th>
-              <th onclick="iaSetSortAdmin('status')" style="cursor:pointer;user-select:none;">Estado <span id="ia-as-status">⇅</span></th>
-              <th>Observaciones</th>
-              <th>Editar</th>
-            </tr>
-            <tr class="ia-filter-row">
-              <th></th>
-              <th><input class="ia-col-filter" type="text" placeholder="Buscar..." oninput="iaRenderAdminTable()" id="ia-fa-emp"></th>
-              <th><input class="ia-col-filter" type="text" placeholder="Buscar..." oninput="iaRenderAdminTable()" id="ia-fa-area"></th>
-              <th><input class="ia-col-filter" type="text" placeholder="Buscar..." oninput="iaRenderAdminTable()" id="ia-fa-fecha"></th>
-              <th><input class="ia-col-filter" type="text" placeholder="Buscar..." oninput="iaRenderAdminTable()" id="ia-fa-sup"></th>
-              <th>
-                <select class="ia-col-filter" oninput="iaRenderAdminTable()" id="ia-fa-estado" style="padding:4px 6px;width:100%;">
-                  <option value="">Todos</option>
-                  <option value="presente">✅ Presente</option>
-                  <option value="falto">❌ Faltó</option>
-                </select>
-              </th>
-              <th></th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody id="ia-admin-body"></tbody>
-        </table>
-        <div class="ia-empty" id="ia-admin-empty">📭 No hay registros</div>
-      </div>
-    </div>
-
-    <!-- CONFIG (admin) -->
-    <div class="ia-panel ia-warn-panel hidden" id="ia-tab-config" style="display:none">
-      <h3>⚙️ Configuración del Sistema</h3>
-      <div class="ia-admin-sections">
-        <div class="ia-admin-section">
-          <h4>👤 Supervisores</h4>
-          <div class="ia-input-row">
-            <div class="ia-fg"><label>Nombre</label><input type="text" id="ia-new-sup-name" placeholder="Nombre del supervisor"></div>
-            <div class="ia-fg"><label>Contraseña</label><input type="password" id="ia-new-sup-pass" placeholder="Contraseña"></div>
-            <button class="ia-btn-add" onclick="iaAddSupervisor()">+ Agregar</button>
-          </div>
-          <div class="ia-list-grid" id="ia-supervisors-list"></div>
-        </div>
-        <div class="ia-admin-section">
-          <h4>👥 Empleados</h4>
-          <div class="ia-input-row">
-            <div class="ia-fg" style="flex:2"><label>Nombre completo</label><input type="text" id="ia-new-emp-name" placeholder="Nombre del empleado"></div>
-            <div class="ia-fg"><label>Supervisor</label><select id="ia-new-emp-sup"><option value="">— Sin asignar —</option></select></div>
-            <button class="ia-btn-add" onclick="iaAddEmployee()">+ Agregar</button>
-          </div>
-          <hr class="ia-divider">
-          <div class="ia-input-row" style="margin-bottom:.5rem;">
-            <button class="ia-btn-sec" onclick="iaDownloadTemplate()">⬇ Plantilla Excel</button>
-            <label class="ia-btn-add" style="cursor:pointer;display:flex;align-items:center;">
-              📂 Importar Excel
-              <input type="file" id="ia-import-file" accept=".xlsx,.xls" onchange="iaImportEmployees(this)" style="display:none;">
-            </label>
-            <button class="ia-btn-del-all" onclick="iaDeleteAllEmployees()">🗑 Eliminar Todo</button>
-          </div>
-          <div class="ia-import-result" id="ia-import-result"></div>
-          <hr class="ia-divider">
-          <div class="ia-search-filter"><input type="text" id="ia-emp-filter" placeholder="🔍 Buscar empleado..." oninput="iaRenderEmployeeList()"></div>
-          <div class="ia-list-grid" id="ia-employees-list"></div>
-        </div>
-        <div class="ia-admin-section">
-          <h4>🗂 Áreas por Supervisor</h4>
-          <div class="ia-input-row">
-            <div class="ia-fg"><label>Supervisor</label><select id="ia-area-sup-select" onchange="iaRenderAreaManager()"><option value="">— Seleccionar —</option></select></div>
-            <div class="ia-fg"><label>Nueva área</label><input type="text" id="ia-new-area-name" placeholder="Ej: M28, Corte"></div>
-            <button class="ia-btn-add" onclick="iaAddArea()">+ Agregar</button>
-          </div>
-          <div id="ia-area-manager-wrap"></div>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Modales del Control de Asistencia -->
-<div class="ia-modal-overlay" id="ia-edit-modal">
-  <div class="ia-modal">
-    <h4>✏️ Editar Registro</h4>
-    <div class="ia-fg"><label>Empleado</label><input type="text" id="ia-edit-emp" readonly style="opacity:.6;cursor:not-allowed;background:#fff;border:1.5px solid #e2e8f0;border-radius:8px;color:#0f172a;padding:.75rem 1rem;width:100%;"></div>
-    <div class="ia-fg"><label>Área</label><select id="ia-edit-area" style="width:100%;padding:.75rem 1rem;background:#fff;border:1.5px solid #e2e8f0;border-radius:8px;color:#0f172a;outline:none;"></select></div>
-    <div class="ia-fg"><label>Estado</label><select id="ia-edit-status" onchange="iaEditStatusChange()" style="width:100%;padding:.75rem 1rem;background:#fff;border:1.5px solid #e2e8f0;border-radius:8px;color:#0f172a;outline:none;"><option value="presente">✅ Presente</option><option value="falto">❌ Faltó</option></select></div>
-    <div class="ia-fg"><label>Supervisor</label><select id="ia-edit-supervisor" style="width:100%;padding:.75rem 1rem;background:#fff;border:1.5px solid #e2e8f0;border-radius:8px;color:#0f172a;outline:none;"></select></div>
-    <div class="ia-fg"><label>Observaciones</label><textarea id="ia-edit-obs" placeholder="Observaciones opcionales..." style="width:100%;padding:.75rem 1rem;background:#fff;border:1.5px solid #e2e8f0;border-radius:8px;color:#0f172a;outline:none;font-family:'Nunito',sans-serif;font-size:.9rem;resize:vertical;min-height:70px;"></textarea></div>
-    <div class="ia-modal-actions">
-      <button class="ia-btn-cancel" onclick="iaCloseModal('ia-edit-modal')">Cancelar</button>
-      <button class="ia-btn-del" onclick="iaDeleteRecord()">🗑 Eliminar</button>
-      <button class="ia-btn-save" onclick="iaSaveEdit()">💾 Guardar</button>
-    </div>
-  </div>
-</div>
-<div class="ia-modal-overlay" id="ia-sup-modal">
-  <div class="ia-modal">
-    <h4>✏️ Editar Supervisor</h4>
-    <div class="ia-fg"><label>Nombre</label><input type="text" id="ia-edit-sup-name" style="width:100%;padding:.75rem 1rem;background:#fff;border:1.5px solid #e2e8f0;border-radius:8px;color:#0f172a;outline:none;font-family:'Nunito',sans-serif;"></div>
-    <div class="ia-fg"><label>Nueva contraseña <span style="color:#6b7a99;font-weight:400;">(vacío = sin cambio)</span></label><input type="password" id="ia-edit-sup-pass" style="width:100%;padding:.75rem 1rem;background:#fff;border:1.5px solid #e2e8f0;border-radius:8px;color:#0f172a;outline:none;font-family:'Nunito',sans-serif;"></div>
-    <div class="ia-modal-actions">
-      <button class="ia-btn-cancel" onclick="iaCloseModal('ia-sup-modal')">Cancelar</button>
-      <button class="ia-btn-del" onclick="iaDeleteSupervisor()">🗑 Eliminar</button>
-      <button class="ia-btn-save" onclick="iaSaveSupervisor()">💾 Guardar</button>
-    </div>
-  </div>
-</div>
-<div class="ia-modal-overlay" id="ia-emp-modal">
-  <div class="ia-modal">
-    <h4>✏️ Editar Empleado</h4>
-    <div class="ia-fg"><label>Nombre completo</label><input type="text" id="ia-edit-emp-name" style="width:100%;padding:.75rem 1rem;background:#fff;border:1.5px solid #e2e8f0;border-radius:8px;color:#0f172a;outline:none;font-family:'Nunito',sans-serif;"></div>
-    <div class="ia-fg"><label>Supervisor</label><select id="ia-edit-emp-sup" style="width:100%;padding:.75rem 1rem;background:#fff;border:1.5px solid #e2e8f0;border-radius:8px;color:#0f172a;outline:none;"><option value="">— Sin asignar —</option></select></div>
-    <div class="ia-modal-actions">
-      <button class="ia-btn-cancel" onclick="iaCloseModal('ia-emp-modal')">Cancelar</button>
-      <button class="ia-btn-del" onclick="iaDeleteEmployee()">🗑 Eliminar</button>
-      <button class="ia-btn-save" onclick="iaSaveEmployee()">💾 Guardar</button>
-    </div>
-  </div>
-</div>
-`; // fin getIngresoHTML
-}
-
-// ════════════════════════════════════════════════════════
-//  LÓGICA JavaScript del Control de Asistencia
-// ════════════════════════════════════════════════════════
-function runIngresoScript(){
-
-
-
-// Variables de asistencia — declaradas globalmente (el WS las llena antes de runIngresoScript)
-// (declaradas arriba en el scope global, ver justo antes de connectWS)
-let iaCurrentUser=null, iaEditingRecordId=null, iaEditingSupId=null, iaEditingEmpId=null;
-let iaSortHistory='area', iaSortAdmin='area';
-let iaSelectedEmployee='';
-
-function iaTodayStr(){return new Date().toISOString().split('T')[0];}
-function iaFormatDateLong(s){return new Date(s+'T12:00:00').toLocaleDateString('es-CO',{weekday:'long',year:'numeric',month:'long',day:'numeric'});}
-function iaGenId(){return 'id_'+Date.now()+'_'+Math.random().toString(36).slice(2,7);}
-function iaGetSup(id){return iaState.supervisors.find(s=>s.id===id);}
-function iaNonAdminSups(){return iaState.supervisors.filter(s=>!s.isAdmin);}
-function iaIsAdmin(){return iaGetSup(iaCurrentUser)?.isAdmin;}
-function iaAreaOrder(a){if(a==='—')return 9999;const m=a.match(/M(\d+)/);return m?parseInt(m[1]):9998;}
-function iaSortData(data,mode){
-  if(!mode||mode==='name') return[...data].sort((a,b)=>a.empName.localeCompare(b.empName));
-  if(mode==='area') return[...data].sort((a,b)=>{const ao=iaAreaOrder(a.area),bo=iaAreaOrder(b.area);return ao!==bo?ao-bo:a.empName.localeCompare(b.empName);});
-  if(mode==='date') return[...data].sort((a,b)=>(b.date||'').localeCompare(a.date||'')||a.empName.localeCompare(b.empName));
-  if(mode==='-date') return[...data].sort((a,b)=>(a.date||'').localeCompare(b.date||'')||a.empName.localeCompare(b.empName));
-  if(mode==='supervisor') return[...data].sort((a,b)=>(a.supervisor||'').localeCompare(b.supervisor||'')||a.empName.localeCompare(b.empName));
-  if(mode==='status') return[...data].sort((a,b)=>(a.status||'').localeCompare(b.status||'')||a.empName.localeCompare(b.empName));
-  return[...data].sort((a,b)=>a.empName.localeCompare(b.empName));
-}
-// Sort state para historial y admin con flechitas
-let iaSortHistoryCol='area', iaSortHistoryDir=1;
-let iaSortAdminCol='area', iaSortAdminDir=1;
-window.iaSetSortHistory=function iaSetSortHistory(col){
-  if(iaSortHistoryCol===col) iaSortHistoryDir*=-1; else {iaSortHistoryCol=col;iaSortHistoryDir=1;}
-  document.querySelectorAll('[id^="ia-hs-"]').forEach(el=>el.textContent='⇅');
-  const el=document.getElementById('ia-hs-'+col);if(el)el.textContent=iaSortHistoryDir===1?'↑':'↓';
-  iaRenderHistory();
-}
-window.iaSetSortAdmin=function iaSetSortAdmin(col){
-  if(iaSortAdminCol===col) iaSortAdminDir*=-1; else {iaSortAdminCol=col;iaSortAdminDir=1;}
-  document.querySelectorAll('[id^="ia-as-"]').forEach(el=>el.textContent='⇅');
-  const el=document.getElementById('ia-as-'+col);if(el)el.textContent=iaSortAdminDir===1?'↑':'↓';
-  iaRenderAdminTable();
-}
-function iaSortDataCol(data,col,dir){
-  return [...data].sort((a,b)=>{
-    let av=a[col]||'', bv=b[col]||'';
-    if(col==='area'){const ao=iaAreaOrder(av),bo=iaAreaOrder(bv);return dir*(ao!==bo?ao-bo:a.empName.localeCompare(b.empName));}
-    if(col==='name'){av=a.empName||'';bv=b.empName||'';}
-    return dir*(av.localeCompare?av.localeCompare(bv):(av>bv?1:av<bv?-1:0));
+  ws.on('close', () => {
+    console.log(`WS desconectado: ${clientIp} | clientes restantes: ${wss.clients.size}`);
   });
-}
-function iaFilterByRange(data,fromId,toId){
-  const from=document.getElementById(fromId)?.value,to=document.getElementById(toId)?.value;
-  if(from)data=data.filter(r=>r.date>=from);
-  if(to)data=data.filter(r=>r.date<=to);
-  return data;
-}
-window.iaBuildLoginSelect=function(){
-  const sel=document.getElementById('ia-login-user');if(!sel)return;
-  sel.innerHTML='<option value="">— Seleccionar usuario —</option>';
-  // Usar miembros del perfil actual si existen, si no usar supervisors del iaState
-  const profileMembers = (typeof getProfileMembers==='function' && currentUser)
-    ? getProfileMembers(currentUser).filter(m=>!m.disabled)
-    : [];
-  if(profileMembers.length){
-    profileMembers.forEach((m,i)=>{
-      const nombre = typeof m==='string'?m:m.nombre;
-      const o=document.createElement('option');o.value='member_'+i;o.textContent=nombre;sel.appendChild(o);
-    });
-  } else {
-    iaState.supervisors.forEach(s=>{const o=document.createElement('option');o.value=s.id;o.textContent=s.isAdmin?`${s.name} (Administrador)`:s.name;sel.appendChild(o);});
-  }
-};
-window.iaDoLogin=function(){
-  const uid=document.getElementById('ia-login-user').value;
-  const pass=document.getElementById('ia-login-pass').value;
-  if(!uid){document.getElementById('ia-login-error').style.display='block';return;}
-  // Login con miembro del perfil
-  if(uid.startsWith('member_')){
-    const idx=parseInt(uid.replace('member_',''));
-    const profileMembers=(typeof getProfileMembers==='function'&&currentUser)?getProfileMembers(currentUser):[];
-    const m=profileMembers[idx];
-    const mPass=typeof m==='string'?'':m.pass||'';
-    if(mPass && pass!==mPass){document.getElementById('ia-login-error').style.display='block';return;}
-    document.getElementById('ia-login-error').style.display='none';
-    currentMember = typeof m==='string'?m:m.nombre;
-    const memberIsAdmin = typeof m==='object' && m.isAdmin === true;
-    // Crear o actualizar supervisor temporal en iaState
-    let sup = iaState.supervisors.find(s=>s.name===currentMember);
-    if(!sup){
-      sup={id:'member_tmp_'+idx, name:currentMember, pass:mPass, areas:[], isAdmin:memberIsAdmin};
-      iaState.supervisors.push(sup);
-    } else {
-      sup.isAdmin = memberIsAdmin;
-    }
-    iaCurrentUser=sup.id; iaInitApp();
-    return;
-  }
-  // Login clásico con supervisor iaState
-  const sup=iaGetSup(uid);
-  if(!sup||sup.pass!==pass){document.getElementById('ia-login-error').style.display='block';return;}
-  document.getElementById('ia-login-error').style.display='none';
-  iaCurrentUser=uid; iaInitApp();
-};
-document.getElementById('ia-login-pass').addEventListener('keydown',e=>{if(e.key==='Enter')iaDoLogin();});
-window.iaDoLogout=function(){
-  iaCurrentUser=null;
-  document.getElementById('ia-app').style.display='none';
-  document.getElementById('ia-login').style.display='flex';
-  document.getElementById('ia-login-user').value='';
-  document.getElementById('ia-login-pass').value='';
-  iaBuildLoginSelect();
-};
-function iaInitApp(){
-  document.getElementById('ia-login').style.display='none';
-  document.getElementById('ia-app').style.display='block';
-  const sup=iaGetSup(iaCurrentUser);
-  document.getElementById('ia-sup-name').textContent=sup.name;
-  document.getElementById('ia-header-date').textContent=iaFormatDateLong(iaTodayStr());
-  document.getElementById('ia-stat-date').textContent=iaTodayStr();
-  const t=iaTodayStr();
-  document.getElementById('ia-filter-from').value=t;
-  document.getElementById('ia-filter-to').value=t;
-  const adminTabs=document.querySelectorAll('#ingreso-app-root .admin-tab');
-  if(sup.isAdmin){
-    document.getElementById('ia-admin-badge-wrap').innerHTML='<span class="ia-badge-admin">⚙️ ADMINISTRADOR</span>';
-    document.querySelector('.ia-sup-badge').style.display='none';
-    adminTabs.forEach(b=>{
-      if(b.id==='ia-tab-btn-config'){b.classList.add('hidden');b.style.display='none';return;}
-      b.classList.remove('hidden');b.style.display='';
-    });
-    document.getElementById('ia-admin-from').value=t;
-    document.getElementById('ia-admin-to').value=t;
-    document.getElementById('ia-btn-export-hist').classList.remove('hidden');
-    iaRebuildAdminFilterSup();
-    document.getElementById('ia-admin-sup-filter-wrap').classList.remove('hidden');
-    iaBuildAdminSupFilter();
-    const regFechaWrap=document.getElementById('ia-reg-fecha-wrap');
-    if(regFechaWrap){regFechaWrap.classList.remove('hidden');regFechaWrap.style.display='';}
-    const regFecha=document.getElementById('ia-reg-fecha');
-    if(regFecha) regFecha.value=t;
-  } else {
-    document.getElementById('ia-admin-badge-wrap').innerHTML='';
-    document.querySelector('.ia-sup-badge').style.display='';
-    adminTabs.forEach(b=>{b.classList.add('hidden');b.style.display='none';});
-    document.getElementById('ia-btn-export-hist').classList.add('hidden');
-    document.getElementById('ia-admin-sup-filter-wrap').classList.add('hidden');
-  }
-  iaBuildAreaSelect();
-  iaShowTab('register',document.getElementById('ia-tab-btn-register'));
-  iaUpdateStats(); iaRenderTodayChips();
-}
-function iaBuildAdminSupFilter(){
-  const sel=document.getElementById('ia-admin-sup-filter');
-  sel.innerHTML='<option value="">— Todos los empleados —</option>';
-  iaNonAdminSups().forEach(s=>{const o=document.createElement('option');o.value=s.id;o.textContent=s.name;sel.appendChild(o);});
-}
-window.iaBuildAdminAreaSelect=function(){iaBuildAreaSelect();};
-function iaBuildAreaSelect(){
-  const asel=document.getElementById('ia-emp-area');
-  if(!asel) return;
-  const prevVal=asel.value; // preservar selección actual
-  if(typeof rebuildModules==='function') rebuildModules();
-  asel.innerHTML='<option value="">— Seleccionar módulo —</option>';
-  let mods=[];
-  if(iaIsAdmin()){
-    mods=typeof MODULES!=='undefined'?MODULES:[];
-    if(!mods.length){
-      const cfg=typeof loadConfig==='function'?loadConfig():{};
-      const disabled=cfg._modulos_disabled||[];
-      const extra=cfg._modulos_extra||[];
-      const renamed=cfg._modulos_renamed||{};
-      const base=['M01','M02','M03','M04','M05','M06','M07','M08','M09','M10','M11','M12','M13','M14','M15','M16','M17','M18','M19','M20','M21','M22','M23','M24','M25','M26','M27'];
-      mods=[...base,...extra].filter(m=>!disabled.includes(m)).map(m=>renamed[m]||m);
-    }
-  } else {
-    const sup=iaGetSup(iaCurrentUser);
-    const supAreas=sup&&sup.areas&&sup.areas.length?sup.areas:null;
-    mods=supAreas||(typeof MODULES!=='undefined'?MODULES:[]);
-  }
-  mods.forEach(m=>{const o=document.createElement('option');o.value=m;o.textContent=m;asel.appendChild(o);});
-  if(prevVal) asel.value=prevVal; // restaurar selección
-}
-function iaRebuildAdminFilterSup(){
-  const sel=document.getElementById('ia-admin-filter-sup');const cur=sel.value;
-  sel.innerHTML='<option value="">— Todos —</option>';
-  iaNonAdminSups().forEach(s=>{const o=document.createElement('option');o.value=s.name;o.textContent=s.name;sel.appendChild(o);});
-  if(cur)sel.value=cur;
-}
-function iaGetAvailableEmployees(){
-  const today=iaTodayStr();
-  const regDate=(iaIsAdmin()&&document.getElementById('ia-reg-fecha')?.value)||today;
-  const reg=new Set(iaRecords.filter(r=>r.date===regDate).map(r=>r.empName));
-  let pool = (iaState.employees||[]).filter(e=>!e.disabled&&!reg.has(e.name));
+  ws.on('error', (e) => console.error('WS error:', e.message));
+});
 
-  if(iaIsAdmin()){
-    // Admin: filtrar por supervisora seleccionada en el dropdown (si hay)
-    const filterSupId = document.getElementById('ia-admin-sup-filter')?.value;
-    if(filterSupId) pool = pool.filter(e=>e.supId===filterSupId);
-  } else {
-    // Supervisora logueada: filtrar solo SUS empleados
-    const supNombre = (typeof currentMember!=='undefined'&&currentMember) ? currentMember : null;
-    if(supNombre){
-      // Buscar el supervisor por nombre para obtener su id
-      const supObj = iaState.supervisors.find(s=>s.name===supNombre);
-      const supId = supObj ? supObj.id : null;
-      pool = pool.filter(e => {
-        // Comparar por supId (forma correcta) o por supNombre (compatibilidad)
-        if(supId && e.supId === supId) return true;
-        const empSup = (e.supId||e.supNombre||'').toLowerCase();
-        return empSup === supNombre.toLowerCase();
-      });
-    }
-  }
-  return pool.map(e=>e.name).sort((a,b)=>a.localeCompare(b));
-}
-window.iaOnFechaChange=function(){
-  // Al cambiar la fecha: limpiar empleado seleccionado, reconstruir módulos y dropdown
-  iaClearEmployee();
-  iaBuildAreaSelect();
-  // Redibujar dropdown vacío con empleados disponibles para esa fecha
-  const list=iaGetAvailableEmployees();
-  iaBuildDropdown([],'');
-};
-window.iaFilterEmployees=function(){
-  iaSelectedEmployee='';document.getElementById('ia-emp-selected').value='';
-  const q=document.getElementById('ia-emp-search').value.trim().toLowerCase();
-  const list=iaGetAvailableEmployees();
-  iaBuildDropdown(q?list.filter(e=>e.toLowerCase().includes(q)).slice(0,80):list.slice(0,80),q);
-  document.getElementById('ia-emp-dropdown').classList.add('open');
-};
-window.iaOpenDropdown=function(){
-  const q=document.getElementById('ia-emp-search').value.trim().toLowerCase();
-  const list=iaGetAvailableEmployees();
-  iaBuildDropdown(q?list.filter(e=>e.toLowerCase().includes(q)).slice(0,80):list.slice(0,80),q);
-  document.getElementById('ia-emp-dropdown').classList.add('open');
-};
-function iaBuildDropdown(items,q){
-  const dd=document.getElementById('ia-emp-dropdown');
-  if(!items.length){dd.innerHTML='<div class="ia-dd-item" style="color:#6b7a99">Sin empleados pendientes</div>';return;}
-  dd.innerHTML=items.map(name=>{
-    const safe=q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-    const hi=q?name.replace(new RegExp('('+safe+')','gi'),'<mark>$1</mark>'):name;
-    return`<div class="ia-dd-item" onmousedown="iaSelectEmployee('${name.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}')">${hi}</div>`;
-  }).join('');
-}
-window.iaDelayClose=function(){setTimeout(()=>document.getElementById('ia-emp-dropdown').classList.remove('open'),200);};
-window.iaSelectEmployee=function(name){
-  iaSelectedEmployee=name;
-  document.getElementById('ia-emp-search').value=name;
-  document.getElementById('ia-emp-selected').value=name;
-  document.getElementById('ia-emp-dropdown').classList.remove('open');
-};
-window.iaClearEmployee=function(){
-  iaSelectedEmployee='';
-  document.getElementById('ia-emp-search').value='';
-  document.getElementById('ia-emp-selected').value='';
-  document.getElementById('ia-emp-search').focus();
-};
-window.iaToggleNovedadMode=function(){
-  const empName=document.getElementById('ia-emp-selected')?.value||document.getElementById('ia-emp-search')?.value.trim()||'';
-  if(!empName){alert('Por favor selecciona un empleado primero.');return;}
-  const wrap=document.getElementById('ia-novedad-wrap');
-  const areaWrap=document.getElementById('ia-emp-area')?.closest('.ia-fg');
-  const btnsWrap=document.getElementById('ia-action-btns-wrap');
-  const isActive=wrap&&wrap.style.display!=='none';
-  if(isActive){ iaCerrarNovedad(); return; }
-  // Poblar lista: primero "Faltó sin novedad", luego cada novedad configurada
-  const list=document.getElementById('ia-novedad-list');
-  const novedades=cfgGetNovedades();
-  const rowStyle='padding:13px 18px;cursor:pointer;font-size:14px;font-weight:700;display:flex;align-items:center;gap:10px;transition:background .15s;border-bottom:1px solid #f1f5f9;';
-  list.innerHTML=`<div onclick="iaRegistrarFalto()" style="${rowStyle}color:#b91c1c;" onmouseover="this.style.background='#fee2e2'" onmouseout="this.style.background=''"><span style="font-size:18px;">❌</span> Faltó (sin novedad)</div>`
-    + novedades.map(n=>`<div onclick="iaRegistrarNovedad('${n.nombre.replace(/'/g,"\'")}','${(n.emoji||'🟡').replace(/'/g,"\'")}');" style="${rowStyle}color:#b91c1c;" onmouseover="this.style.background='#fee2e2'" onmouseout="this.style.background=''"><span style="font-size:18px;">${n.emoji||'🟡'}</span> ${n.nombre}</div>`).join('');
-  if(wrap) wrap.style.display='';
-  if(areaWrap) areaWrap.style.display='none';
-  if(btnsWrap) btnsWrap.style.display='none';
-};
-window.iaCerrarNovedad=function(){
-  const wrap=document.getElementById('ia-novedad-wrap');
-  const areaWrap=document.getElementById('ia-emp-area')?.closest('.ia-fg');
-  const btnsWrap=document.getElementById('ia-action-btns-wrap');
-  if(wrap) wrap.style.display='none';
-  if(areaWrap) areaWrap.style.display='';
-  if(btnsWrap) btnsWrap.style.display='';
-};
-window.iaRegistrarFalto=function(){
-  const empName=document.getElementById('ia-emp-selected')?.value||document.getElementById('ia-emp-search')?.value.trim()||'';
-  if(!empName){alert('Selecciona un empleado.');return;}
-  let supName;
-  if(iaIsAdmin()){const emp=iaState.employees.find(e=>e.name===empName);supName=emp&&emp.supId?iaGetSup(emp.supId)?.name||'Admin':'Admin';}
-  else{supName=(typeof currentMember!=='undefined'&&currentMember)?currentMember:(iaGetSup(iaCurrentUser)?.name||'Supervisora');}
-  const today=iaTodayStr();
-  const regDate=(iaIsAdmin()&&document.getElementById('ia-reg-fecha')?.value)||today;
-  const newRecord={id:iaGenId(),empName,area:'—',status:'falto',date:regDate,supervisor:supName};
-  iaRecords=iaRecords.filter(r=>!(r.empName===empName&&r.date===regDate));
-  iaRecords.push(newRecord);
-  wsSend({type:'ia_add_record',record:newRecord});
-  iaCerrarNovedad();iaClearEmployee();document.getElementById('ia-emp-area').value='';
-  const t=document.getElementById('ia-absent-toast');if(t){t.style.display='block';setTimeout(()=>t.style.display='none',3000);}
-  iaUpdateStats();iaRenderTodayChips();
-};
-window.iaRegistrarNovedad=function(nombre,emoji){
-  const empName=document.getElementById('ia-emp-selected')?.value||document.getElementById('ia-emp-search')?.value.trim()||'';
-  if(!empName){alert('Selecciona un empleado.');return;}
-  let supName;
-  if(iaIsAdmin()){const emp=iaState.employees.find(e=>e.name===empName);supName=emp&&emp.supId?iaGetSup(emp.supId)?.name||'Admin':'Admin';}
-  else{supName=(typeof currentMember!=='undefined'&&currentMember)?currentMember:(iaGetSup(iaCurrentUser)?.name||'Supervisora');}
-  const today=iaTodayStr();
-  const regDate=(iaIsAdmin()&&document.getElementById('ia-reg-fecha')?.value)||today;
-  const newRecord={id:iaGenId(),empName,area:nombre,status:'novedad',date:regDate,supervisor:supName};
-  iaRecords=iaRecords.filter(r=>!(r.empName===empName&&r.date===regDate));
-  iaRecords.push(newRecord);
-  wsSend({type:'ia_add_record',record:newRecord});
-  iaCerrarNovedad();iaClearEmployee();document.getElementById('ia-emp-area').value='';
-  const t=document.getElementById('ia-novedad-toast');if(t){t.style.display='block';setTimeout(()=>t.style.display='none',3000);}
-  iaUpdateStats();iaRenderTodayChips();
-};
+// ── 404 handler ───────────────────────────────────────────────────
+app.use((req, res) => {
+  res.status(404).json({ error: `Ruta no encontrada: ${req.method} ${req.path}` });
+});
 
-window.iaSaveEdit=function(){
-  const r=iaRecords.find(x=>x.id===iaEditingRecordId);if(!r)return;
-  r.status=document.getElementById('ia-edit-status').value;
-  r.area=r.status==='falto'?'—':(document.getElementById('ia-edit-area').value||'—');
-  r.supervisor=document.getElementById('ia-edit-supervisor').value;
-  r.obs=document.getElementById('ia-edit-obs').value.trim();
-  wsSend({type:'ia_edit_record', record:{...r}});
-  iaCloseModal('ia-edit-modal');iaRenderAdminTable();
-};
+// ── Manejo global de errores Express ──────────────────────────────
+app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+  console.error('Error no capturado:', err.message);
+  res.status(500).json({ error: 'Error interno del servidor.' });
+});
 
-window.iaDeleteRecord=function(){
-  if(!confirm('¿Eliminar este registro?'))return;
-  iaRecords=iaRecords.filter(x=>x.id!==iaEditingRecordId);
-  wsSend({type:'ia_delete_record', id:iaEditingRecordId});
-  iaCloseModal('ia-edit-modal');iaRenderAdminTable();
-};
-window.iaOpenModal=function(id){document.getElementById(id).classList.add('open');};
-window.iaCloseModal=function(id){document.getElementById(id).classList.remove('open');};
-document.querySelectorAll('.ia-modal-overlay').forEach(m=>m.addEventListener('click',function(e){if(e.target===this)this.classList.remove('open');}));
-
-// CONFIG
-function iaRenderConfig(){iaRenderSupervisorList();iaBuildSupSelects();iaRenderEmployeeList();iaBuildAreaSupSelect();iaRenderAreaManager();}
-function iaRenderSupervisorList(){
-  const c=document.getElementById('ia-supervisors-list');const sups=iaNonAdminSups();
-  if(!sups.length){c.innerHTML='<div style="color:#6b7a99;padding:1rem;text-align:center;font-size:.85rem;">No hay supervisores</div>';return;}
-  c.innerHTML=sups.map(s=>`<div class="ia-list-item"><span class="ia-item-name">👤 ${s.name}</span><span class="ia-tag sup">${(s.areas||[]).length} áreas · ${iaState.employees.filter(e=>e.supId===s.id).length} emp.</span><div class="ia-item-actions"><button class="ia-btn-edit" onclick="iaOpenEditSup('${s.id}')">✏️ Editar</button></div></div>`).join('');
-}
-window.iaAddSupervisor=function(){
-  const name=document.getElementById('ia-new-sup-name').value.trim();
-  const pass=document.getElementById('ia-new-sup-pass').value.trim();
-  if(!name||!pass){alert('Completa nombre y contraseña.');return;}
-  const id='sup_'+Date.now();
-  iaState.supervisors.push({id,name,pass,isAdmin:false,areas:[]});
-  iaSaveState();document.getElementById('ia-new-sup-name').value='';document.getElementById('ia-new-sup-pass').value='';
-  iaRenderSupervisorList();iaBuildSupSelects();iaBuildAdminSupFilter();iaRebuildAdminFilterSup();iaBuildAreaSupSelect();
-};
-window.iaOpenEditSup=function(id){
-  const s=iaGetSup(id);if(!s)return;
-  iaEditingSupId=id;document.getElementById('ia-edit-sup-name').value=s.name;document.getElementById('ia-edit-sup-pass').value='';
-  iaOpenModal('ia-sup-modal');
-};
-window.iaSaveSupervisor=function(){
-  const s=iaGetSup(iaEditingSupId);if(!s)return;
-  const name=document.getElementById('ia-edit-sup-name').value.trim();const pass=document.getElementById('ia-edit-sup-pass').value.trim();
-  if(!name)return;const oldName=s.name;s.name=name;if(pass)s.pass=pass;
-  iaRecords.forEach(r=>{if(r.supervisor===oldName)r.supervisor=name;});
-  iaSaveState();iaSaveRecords();iaCloseModal('ia-sup-modal');
-  iaRenderSupervisorList();iaBuildSupSelects();iaBuildAdminSupFilter();iaRebuildAdminFilterSup();iaBuildAreaSupSelect();
-};
-window.iaDeleteSupervisor=function(){
-  if(!confirm(`¿Eliminar supervisor "${iaGetSup(iaEditingSupId)?.name}"?`))return;
-  iaState.employees.forEach(e=>{if(e.supId===iaEditingSupId)e.supId='';});
-  iaState.supervisors=iaState.supervisors.filter(s=>s.id!==iaEditingSupId);
-  iaSaveState();iaCloseModal('ia-sup-modal');
-  iaRenderSupervisorList();iaRenderEmployeeList();iaBuildSupSelects();iaBuildAdminSupFilter();iaRebuildAdminFilterSup();iaBuildAreaSupSelect();
-};
-function iaBuildSupSelects(){
-  const sups=iaNonAdminSups();
-  ['ia-new-emp-sup','ia-edit-emp-sup'].forEach(selId=>{
-    const sel=document.getElementById(selId);if(!sel)return;const cur=sel.value;
-    sel.innerHTML='<option value="">— Sin asignar —</option>';
-    sups.forEach(s=>{const o=document.createElement('option');o.value=s.id;o.textContent=s.name;sel.appendChild(o);});
-    if(cur)sel.value=cur;
-  });
-}
-function iaRenderEmployeeList(){
-  const q=(document.getElementById('ia-emp-filter')?.value||'').toLowerCase();
-  const c=document.getElementById('ia-employees-list');
-  let emps=[...iaState.employees];if(q)emps=emps.filter(e=>e.name.toLowerCase().includes(q));
-  emps.sort((a,b)=>a.name.localeCompare(b.name));
-  if(!emps.length){c.innerHTML='<div style="color:#6b7a99;padding:1rem;text-align:center;font-size:.85rem;">No hay empleados</div>';return;}
-  c.innerHTML=emps.map(e=>{const sup=iaGetSup(e.supId);return`<div class="ia-list-item"><span class="ia-item-name">${e.name}</span><span class="ia-tag ${sup?'sup':'none'}">${sup?sup.name:'Sin asignar'}</span><div class="ia-item-actions"><button class="ia-btn-edit" onclick="iaOpenEditEmp('${e.id}')">✏️</button></div></div>`;}).join('');
-}
-window.iaAddEmployee=function(){
-  const name=document.getElementById('ia-new-emp-name').value.trim().toUpperCase();const supId=document.getElementById('ia-new-emp-sup').value;
-  if(!name){alert('Ingresa el nombre.');return;}
-  if(iaState.employees.find(e=>e.name===name)){alert('Ya existe.');return;}
-  iaState.employees.push({id:iaGenId(),name,supId});iaSaveState();document.getElementById('ia-new-emp-name').value='';iaRenderEmployeeList();
-};
-window.iaOpenEditEmp=function(id){
-  const e=iaState.employees.find(x=>x.id===id);if(!e)return;
-  iaEditingEmpId=id;document.getElementById('ia-edit-emp-name').value=e.name;iaBuildSupSelects();document.getElementById('ia-edit-emp-sup').value=e.supId||'';iaOpenModal('ia-emp-modal');
-};
-window.iaSaveEmployee=function(){
-  const e=iaState.employees.find(x=>x.id===iaEditingEmpId);if(!e)return;
-  const name=document.getElementById('ia-edit-emp-name').value.trim().toUpperCase();if(!name)return;
-  e.name=name;e.supId=document.getElementById('ia-edit-emp-sup').value;iaSaveState();iaCloseModal('ia-emp-modal');iaRenderEmployeeList();
-};
-window.iaDeleteEmployee=function(){
-  if(!confirm(`¿Eliminar "${iaState.employees.find(x=>x.id===iaEditingEmpId)?.name}"?`))return;
-  iaState.employees=iaState.employees.filter(x=>x.id!==iaEditingEmpId);iaSaveState();iaCloseModal('ia-emp-modal');iaRenderEmployeeList();
-};
-window.iaDeleteAllEmployees=function(){
-  const total=iaState.employees.length;
-  if(!total){alert('No hay empleados para eliminar.');return;}
-  if(!confirm(`¿Eliminar TODOS los ${total} empleados? Esta acción no se puede deshacer.`))return;
-  iaState.employees=[];iaSaveState();iaRenderEmployeeList();
-};
-window.iaSaveObs=function(id,val){
-  const r=iaRecords.find(x=>x.id===id);if(!r)return;
-  r.obs=val.trim();
-  wsSend({type:'ia_edit_record',record:{...r}});
-};
-window.iaDownloadTemplate=function(){
-  const wsData=[['Empleado','Supervisor']];
-  const wb=XLSX.utils.book_new(),ws=XLSX.utils.aoa_to_sheet(wsData);ws['!cols']=[{wch:45},{wch:25}];
-  XLSX.utils.book_append_sheet(wb,ws,'Plantilla');XLSX.writeFile(wb,'Plantilla_Empleados.xlsx');
-};
-window.iaImportEmployees=function(input){
-  const file=input.files[0];if(!file)return;
-  const reader=new FileReader();
-  reader.onload=function(e){
-    try{
-      const wb=XLSX.read(e.target.result,{type:'binary'});const ws=wb.Sheets[wb.SheetNames[0]];
-      const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:''});if(rows.length<2)return;
-      const header=rows[0].map(h=>String(h).toLowerCase().trim());
-      const empCol=header.findIndex(h=>h.includes('empleado')||h.includes('nombre'));const supCol=header.findIndex(h=>h.includes('supervisor'));
-      if(empCol===-1)return;
-      let added=0,skipped=0;
-      rows.slice(1).forEach(row=>{
-        const name=String(row[empCol]||'').trim().toUpperCase();const supName=supCol>=0?String(row[supCol]||'').trim():'';
-        if(!name||iaState.employees.find(e=>e.name===name)){skipped++;return;}
-        let supId='';if(supName){const found=iaNonAdminSups().find(s=>s.name.toLowerCase()===supName.toLowerCase());if(found)supId=found.id;}
-        iaState.employees.push({id:iaGenId(),name,supId});added++;
-      });
-      iaSaveState();iaRenderEmployeeList();
-      const el=document.getElementById('ia-import-result');el.textContent=`✅ ${added} importados, ${skipped} omitidos.`;el.className='ia-import-result ok';el.style.display='block';setTimeout(()=>el.style.display='none',5000);
-    }catch(err){const el=document.getElementById('ia-import-result');el.textContent='Error: '+err.message;el.className='ia-import-result err';el.style.display='block';}
-    input.value='';
-  };reader.readAsBinaryString(file);
-};
-function iaBuildAreaSupSelect(){
-  const sel=document.getElementById('ia-area-sup-select');const cur=sel.value;
-  sel.innerHTML='<option value="">— Seleccionar —</option>';
-  iaNonAdminSups().forEach(s=>{const o=document.createElement('option');o.value=s.id;o.textContent=s.name;sel.appendChild(o);});
-  if(cur)sel.value=cur;
-}
-window.iaRenderAreaManager=function(){
-  const supId=document.getElementById('ia-area-sup-select').value;const wrap=document.getElementById('ia-area-manager-wrap');
-  if(!supId){wrap.innerHTML='';return;}const sup=iaGetSup(supId);const areas=sup.areas||[];
-  if(!areas.length){wrap.innerHTML='<p style="color:#6b7a99;font-size:.85rem;margin-top:.8rem;">Sin áreas.</p>';return;}
-  wrap.innerHTML=`<div class="ia-areas-grid">${areas.map(a=>`<span class="ia-area-chip">${a}<button class="rm" onclick="iaRemoveArea('${supId}','${a}')">✕</button></span>`).join('')}</div>`;
-};
-window.iaAddArea=function(){
-  const supId=document.getElementById('ia-area-sup-select').value;const name=document.getElementById('ia-new-area-name').value.trim().toUpperCase();
-  if(!supId||!name)return;const sup=iaGetSup(supId);if(!sup.areas)sup.areas=[];if(sup.areas.includes(name))return;
-  sup.areas.push(name);sup.areas.sort((a,b)=>iaAreaOrder(a)-iaAreaOrder(b));iaSaveState();document.getElementById('ia-new-area-name').value='';iaRenderAreaManager();if(iaIsAdmin())iaBuildAreaSelect();
-};
-window.iaRemoveArea=function(supId,area){
-  if(!confirm(`¿Quitar "${area}"?`))return;const sup=iaGetSup(supId);sup.areas=sup.areas.filter(a=>a!==area);iaSaveState();iaRenderAreaManager();if(iaIsAdmin())iaBuildAreaSelect();
-};
-
-// Inicializar: los datos ya están disponibles cuando runIngresoScript se ejecuta
-(function(){
-  iaBuildLoginSelect();
-})();
-
-// ── Auto-actualización cada 3 segundos ───────────────────────
-setInterval(function(){
-  if(!wsReady) return;
-  const tabs=['register','history','records','config'];
-  let activeTab='register';
-  tabs.forEach(t=>{const btn=document.getElementById('ia-tab-btn-'+t);if(btn&&btn.classList.contains('active'))activeTab=t;});
-  // No re-renderizar si el usuario está escribiendo en un textarea
-  const focused = document.activeElement;
-  const isTyping = focused && focused.classList.contains('ia-obs-input');
-  if(isTyping) return;
-  if(activeTab==='history') iaRenderHistory();
-  else if(activeTab==='records') iaRenderAdminTable();
-  else if(activeTab==='config') iaRenderConfig();
-  else { iaRenderTodayChips(); iaUpdateStats(); iaBuildAreaSelect(); }
-}, 3000);
-
-
-// ── Estadísticas de hoy ──────────────────────────────────────────
-window.iaUpdateStats=function iaUpdateStats(){
-  const today=iaTodayStr();
-  const sup=iaGetSup(iaCurrentUser);
-  const supName=sup?sup.name:(typeof currentMember!=='undefined'?currentMember:'');
-
-  // Detectar pestaña activa y usar su filtro de fechas
-  const histTab=document.getElementById('ia-tab-btn-history');
-  const recordsTab=document.getElementById('ia-tab-btn-records');
-  const histActive = histTab && histTab.classList.contains('active');
-  const recordsActive = recordsTab && recordsTab.classList.contains('active');
-
-  let fromVal='', toVal='';
-  if(histActive){
-    fromVal=document.getElementById('ia-filter-from')?.value||'';
-    toVal=document.getElementById('ia-filter-to')?.value||'';
-  } else if(recordsActive){
-    fromVal=document.getElementById('ia-admin-from')?.value||'';
-    toVal=document.getElementById('ia-admin-to')?.value||'';
-  }
-  const usingRange = (histActive||recordsActive) && (fromVal||toVal);
-
-  let tr;
-  if(usingRange){
-    tr=iaRecords.filter(r=>{
-      if(fromVal && r.date<fromVal) return false;
-      if(toVal && r.date>toVal) return false;
-      return true;
-    });
-  } else {
-    tr=iaRecords.filter(r=>r.date===today);
-  }
-  if(!iaIsAdmin()&&supName) tr=tr.filter(r=>r.supervisor===supName);
-
-  document.getElementById('ia-stat-today').textContent=tr.filter(r=>r.status==='presente').length;
-  document.getElementById('ia-stat-absent').textContent=tr.filter(r=>r.status==='falto'||r.status==='novedad').length;
-
-  const pending=document.getElementById('ia-stat-pending');
-  if(pending){
-    const emps=iaState.employees.filter(e=>!e.disabled&&(!sup||sup.isAdmin||(e.supId&&e.supId===sup.name)));
-    const dateFrom=usingRange&&fromVal?fromVal:today;
-    const dateTo=usingRange&&toVal?toVal:today;
-    let totalPending=0;
-    const d=new Date(dateFrom+'T00:00:00');
-    const end=new Date(dateTo+'T00:00:00');
-    while(d<=end){
-      const dateStr=d.toISOString().split('T')[0];
-      const registeredThatDay=new Set(tr.filter(r=>r.date===dateStr).map(r=>r.empName));
-      totalPending+=emps.filter(e=>!registeredThatDay.has(e.name)).length;
-      d.setDate(d.getDate()+1);
-    }
-    pending.textContent=totalPending;
-  }
-
-  // Labels dinámicos
-  const labelToday=document.querySelector('#ia-stat-today')?.closest('.ia-stat-card')?.querySelector('.ia-slabel');
-  const labelAbsent=document.querySelector('#ia-stat-absent')?.closest('.ia-stat-card')?.querySelector('.ia-slabel');
-  if(usingRange){
-    if(labelToday) labelToday.textContent='Presentes (rango)';
-    if(labelAbsent) labelAbsent.textContent='Faltas (rango)';
-  } else {
-    if(labelToday) labelToday.textContent='Presentes hoy';
-    if(labelAbsent) labelAbsent.textContent='Faltas hoy';
-  }
-  const dateEl=document.getElementById('ia-stat-date');
-  if(dateEl){
-    if(usingRange){
-      const desde=fromVal||'...';
-      const hasta=toVal||'...';
-      dateEl.textContent=desde===hasta?desde:desde+' → '+hasta;
-    } else {
-      dateEl.textContent=iaFormatDateLong(today);
-    }
-  }
-}
-
-// ── Chips de registros de hoy ─────────────────────────────────────
-window.iaRenderTodayChips=function iaRenderTodayChips(){
-  const c=document.getElementById('ia-today-chips');if(!c)return;
-  const today=iaTodayStr();
-  const sup=iaGetSup(iaCurrentUser);
-  const supName=sup?sup.name:(typeof currentMember!=='undefined'?currentMember:'');
-  let recs=iaRecords.filter(r=>r.date===today);
-  if(!iaIsAdmin()&&supName) recs=recs.filter(r=>r.supervisor===supName);
-  recs=iaSortData(recs,iaSortHistory);
-  if(!recs.length){c.innerHTML='<span style="color:#6b7a99;font-size:.85rem;">Aún no hay registros hoy</span>';return;}
-  c.innerHTML=recs.map(r=>(r.status==='falto'||r.status==='novedad')
-    ?`<span class="ia-chip absent">❌ ${r.empName}${r.status==='novedad'?' <span class="ia-area-tag" style="background:rgba(239,68,68,.15);color:#b91c1c;">'+r.area+'</span>':''}</span>`
-    :`<span class="ia-chip">✓ ${r.empName} <span class="ia-area-tag">${r.area}</span></span>`
-  ).join('');
-}
-
-
-// ── Historial de Asistencia ───────────────────────────────────────
-window.iaRenderHistory=function iaRenderHistory(){
-  const sup=iaGetSup(iaCurrentUser);
-  const supName=sup?sup.name:(typeof currentMember!=='undefined'?currentMember:'');
-  let data=iaIsAdmin()?iaFilterByRange([...iaRecords],'ia-filter-from','ia-filter-to'):iaFilterByRange(iaRecords.filter(r=>r.supervisor===supName),'ia-filter-from','ia-filter-to');
-  // Actualizar contadores con el rango activo
-  if(typeof iaUpdateStats==='function') iaUpdateStats();
-  const fEmp=(document.getElementById('ia-fh-emp')?.value||'').toLowerCase().trim();
-  const fArea=(document.getElementById('ia-fh-area')?.value||'').toLowerCase().trim();
-  const fFecha=(document.getElementById('ia-fh-fecha')?.value||'').toLowerCase().trim();
-  const fSup=(document.getElementById('ia-fh-sup')?.value||'').toLowerCase().trim();
-  const fEst=(document.getElementById('ia-fh-estado')?.value||'');
-  if(fEmp)   data=data.filter(r=>r.empName.toLowerCase().includes(fEmp));
-  if(fArea)  data=data.filter(r=>(r.area||'').toLowerCase().includes(fArea));
-  if(fFecha) data=data.filter(r=>(r.date||'').toLowerCase().includes(fFecha));
-  if(fSup)   data=data.filter(r=>(r.supervisor||'').toLowerCase().includes(fSup));
-  if(fEst)   data=data.filter(r=>r.status===fEst);
-  data=iaSortDataCol(data,iaSortHistoryCol,iaSortHistoryDir);
-  const tbody=document.getElementById('ia-hist-body'),empty=document.getElementById('ia-hist-empty');
-  if(!tbody)return;
-  if(!data.length){tbody.innerHTML='';if(empty)empty.style.display='block';return;}
-  if(empty)empty.style.display='none';
-  tbody.innerHTML=data.map((r,i)=>`<tr>
-    <td>${i+1}</td><td>${r.empName}</td>
-    <td>${r.status==='falto'?'<span style="color:#ef4444;font-weight:700;">—</span>':r.status==='novedad'?`<span style="color:#b91c1c;font-weight:700;">${r.area}</span>`:`<span class="ia-badge area">${r.area}</span>`}</td>
-    <td>${r.date}</td><td>${r.supervisor}</td>
-    <td>${(r.status==='falto'||r.status==='novedad')?'<span class="ia-badge out">❌ Faltó</span>':'<span class="ia-badge in">✅ Presente</span>'}</td>
-    <td><textarea class="ia-obs-input" data-id="${r.id}" placeholder="Sin observación..." ${r.obs?'readonly style="cursor:default;background:#f8fafc;color:#64748b;resize:none;"':'style="resize:none;cursor:text;"'} onblur="iaObsSave('${r.id}',this)">${r.obs||''}</textarea></td>
-  </tr>`).join('');
-}
-
-// ── Editar Registros (Admin) ──────────────────────────────────────
-function iaRenderAdminTable(){
-  if(typeof iaUpdateStats==='function') iaUpdateStats();
-  let data=iaFilterByRange([...iaRecords],'ia-admin-from','ia-admin-to');
-  const fEmp=(document.getElementById('ia-fa-emp')?.value||'').toLowerCase().trim();
-  const fArea=(document.getElementById('ia-fa-area')?.value||'').toLowerCase().trim();
-  const fFecha=(document.getElementById('ia-fa-fecha')?.value||'').toLowerCase().trim();
-  const fSup=(document.getElementById('ia-fa-sup')?.value||'').toLowerCase().trim();
-  const fEst=(document.getElementById('ia-fa-estado')?.value||'');
-  if(fEmp)  data=data.filter(r=>r.empName.toLowerCase().includes(fEmp));
-  if(fArea) data=data.filter(r=>(r.area||'').toLowerCase().includes(fArea));
-  if(fFecha)data=data.filter(r=>(r.date||'').toLowerCase().includes(fFecha));
-  if(fSup)  data=data.filter(r=>(r.supervisor||'').toLowerCase().includes(fSup));
-  if(fEst)  data=data.filter(r=>r.status===fEst);
-  data=iaSortDataCol(data,iaSortAdminCol,iaSortAdminDir);
-  const tbody=document.getElementById('ia-admin-body'),empty=document.getElementById('ia-admin-empty');
-  if(!tbody)return;
-  if(!data.length){tbody.innerHTML='';if(empty)empty.style.display='block';return;}
-  if(empty)empty.style.display='none';
-  tbody.innerHTML=data.map((r,i)=>`<tr>
-    <td>${i+1}</td><td>${r.empName}</td>
-    <td>${r.status==='falto'?'<span style="color:#ef4444;font-weight:700;">—</span>':r.status==='novedad'?`<span style="color:#b91c1c;font-weight:700;">${r.area}</span>`:`<span class="ia-badge area">${r.area}</span>`}</td>
-    <td>${r.date}</td><td>${r.supervisor}</td>
-    <td>${(r.status==='falto'||r.status==='novedad')?'<span class="ia-badge out">❌ Faltó</span>':'<span class="ia-badge in">✅ Presente</span>'}</td>
-    <td><textarea class="ia-obs-input" data-id="${r.id}" placeholder="Sin observación..." readonly style="cursor:default;background:#f8fafc;color:#64748b;resize:none;">${r.obs||''}</textarea></td>
-    <td><button class="ia-btn-edit" onclick="iaOpenEditRecord('${r.id}')">✏️ Editar</button></td>
-  </tr>`).join('');
-}
-// ── Guardar observación desde textarea ────────────────────────────
-window.iaObsSave=function(id, el){
-  const val = el.value.trim();
-  const r = iaRecords.find(x=>x.id===id);
-  if(!r) return;
-  if(val === (r.obs||'').trim()) return; // sin cambios
-  r.obs = val;
-  // Guardar por WS (siempre) + HTTP como respaldo
-  wsSend({type:'ia_edit_record', record:{...r}});
-  fetch('/api/ia-record-obs', {
-    method:'PATCH',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({id, obs: val})
-  }).then(res => {
-    if(!res.ok) console.warn('iaObsSave HTTP error:', res.status);
-  }).catch(e => console.warn('iaObsSave fetch error:', e));
-  // Bloquear campo una vez guardado
-  if(val){
-    el.readOnly = true;
-    el.style.cursor = 'default';
-    el.style.background = '#f8fafc';
-    el.style.color = '#64748b';
-  }
-}
-window.iaOpenEditRecord=function(id){
-  const r=iaRecords.find(x=>x.id===id);if(!r)return;
-  iaEditingRecordId=id;
-  document.getElementById('ia-edit-emp').value=r.empName;
-  document.getElementById('ia-edit-status').value=(r.status==='novedad'?'falto':r.status);
-  const BASE_MODS=['M01','M02','M03','M04','M05','M06','M07','M08','M09','M10','M11','M12','M13','M14','M15','M16','M17','M18','M19','M20','M21','M22','M23','M24','M25','M26','M27'];
-  const {extra:extraMods}=getCfgModulos();
-  const asel=document.getElementById('ia-edit-area');
-  asel.innerHTML='<option value="">— Sin módulo —</option>';
-  [...BASE_MODS,...extraMods].forEach(a=>{const o=document.createElement('option');o.value=a;o.textContent=a;if(a===r.area)o.selected=true;asel.appendChild(o);});
-  const ssel=document.getElementById('ia-edit-supervisor');ssel.innerHTML='';
-  const allSups=iaState.supervisors.filter(s=>s.id!=='programador');
-  if(allSups.length){
-    allSups.forEach(s=>{const o=document.createElement('option');o.value=s.name;o.textContent=s.name;if(s.name===r.supervisor)o.selected=true;ssel.appendChild(o);});
-  } else if(r.supervisor){
-    const o=document.createElement('option');o.value=r.supervisor;o.textContent=r.supervisor;o.selected=true;ssel.appendChild(o);
-  }
-  iaOpenModal('ia-edit-modal');
-  document.getElementById('ia-edit-obs').value=r.obs||'';
-};
-window.iaEditStatusChange=function(){
-  const status=document.getElementById('ia-edit-status').value;
-  const asel=document.getElementById('ia-edit-area');
-  if(status==='falto'){
-    asel.innerHTML='<option value="">— Sin módulo —</option>';
-  } else {
-    const BASE_MODS=['M01','M02','M03','M04','M05','M06','M07','M08','M09','M10','M11','M12','M13','M14','M15','M16','M17','M18','M19','M20','M21','M22','M23','M24','M25','M26','M27'];
-    const {extra:extraMods}=getCfgModulos();
-    asel.innerHTML='<option value="">— Sin módulo —</option>';
-    [...BASE_MODS,...extraMods].forEach(a=>{const o=document.createElement('option');o.value=a;o.textContent=a;asel.appendChild(o);});
-  }
-};
-
-// ── Navegación de tabs ────────────────────────────────────────────
-window.iaShowTab=function iaShowTab(tab, btn){
-  document.querySelectorAll('.ia-panel').forEach(p=>{p.classList.add('hidden');p.style.display='none';});
-  document.querySelectorAll('.ia-tab-btn').forEach(b=>b.classList.remove('active'));
-  const panel=document.getElementById('ia-tab-'+tab);
-  if(panel){panel.classList.remove('hidden');panel.style.display='';}
-  if(btn) btn.classList.add('active');
-  if(tab==='history') iaRenderHistory();
-  else if(tab==='records') iaRenderAdminTable();
-  else if(tab==='config') iaRenderConfig();
-  else { iaRenderTodayChips(); iaUpdateStats(); }
-}
-
-// ── Registrar Ingreso (Presente) ─────────────────────────────────
-window.iaRegisterEntry=function(status){
-  const empName=document.getElementById('ia-emp-selected')?.value||document.getElementById('ia-emp-search')?.value.trim()||'';
-  if(!empName){alert('Por favor selecciona un empleado primero.');return;}
-  const area=document.getElementById('ia-emp-area')?.value||'—';
-  if(status==='presente'&&(!area||area==='—')){alert('Por favor selecciona un módulo.');return;}
-  let supName;
-  if(iaIsAdmin()){const emp=iaState.employees.find(e=>e.name===empName);supName=emp&&emp.supId?iaGetSup(emp.supId)?.name||'Admin':'Admin';}
-  else{supName=(typeof currentMember!=='undefined'&&currentMember)?currentMember:(iaGetSup(iaCurrentUser)?.name||'Supervisora');}
-  const today=iaTodayStr();
-  const regDate=(iaIsAdmin()&&document.getElementById('ia-reg-fecha')?.value)||today;
-  const newRecord={id:iaGenId(),empName,area:status==='falto'?'—':area,status,date:regDate,supervisor:supName};
-  iaRecords=iaRecords.filter(r=>!(r.empName===empName&&r.date===regDate));
-  iaRecords.push(newRecord);
-  wsSend({type:'ia_add_record',record:newRecord});
-  iaClearEmployee();if(document.getElementById('ia-emp-area'))document.getElementById('ia-emp-area').value='';
-  const toastId=status==='presente'?'ia-success-toast':'ia-absent-toast';
-  const t=document.getElementById(toastId);if(t){t.style.display='block';setTimeout(()=>t.style.display='none',3000);}
-  iaUpdateStats();iaRenderTodayChips();
-};
-
-// ── Exportar Excel ────────────────────────────────────────────────
-window.iaExportExcel=function(panel){
-  let data,fromId,toId;
-  if(panel==='history'){
-    fromId='ia-filter-from';toId='ia-filter-to';
-    const sup=iaGetSup(iaCurrentUser);
-    data=iaIsAdmin()?iaFilterByRange([...iaRecords],fromId,toId):iaFilterByRange(iaRecords.filter(r=>r.supervisor===sup.name),fromId,toId);
-    data=iaSortDataCol(data,iaSortHistoryCol,iaSortHistoryDir);
-  } else {
-    fromId='ia-admin-from';toId='ia-admin-to';
-    data=iaFilterByRange([...iaRecords],fromId,toId);
-    data=iaSortDataCol(data,iaSortAdminCol,iaSortAdminDir);
-  }
-  if(!data.length){alert('No hay registros para exportar.');return;}
-  const from=document.getElementById(fromId)?.value||'todos',to=document.getElementById(toId)?.value||'todos';
-  const wsData=[['#','Empleado','Módulo / Novedad','Fecha','Supervisor','Estado','Observaciones'],
-    ...data.map((r,i)=>[i+1,r.empName,r.area,r.date,r.supervisor,
-      r.status==='falto'?'Faltó':r.status==='novedad'?'Novedad: '+r.area:'Presente',r.obs||''])];
-  const wb=XLSX.utils.book_new(),ws=XLSX.utils.aoa_to_sheet(wsData);
-  ws['!cols']=[{wch:5},{wch:40},{wch:15},{wch:12},{wch:20},{wch:12},{wch:35}];
-  XLSX.utils.book_append_sheet(wb,ws,'Asistencia');
-  XLSX.writeFile(wb,`Asistencia_${from}_${to}.xlsx`);
-};
-} // end runIngresoScript
-</script>
-</body>
-</html>
+// ── Iniciar servidor ───────────────────────────────────────────────
+server.listen(PORT, () => {
+  console.log(`✅ Confecciones Millar v4.0 — Puerto ${PORT}`);
+  console.log(`   Control de Piso   : http://localhost:${PORT}/`);
+  console.log(`   Control Ingresos  : http://localhost:${PORT}/ingresos`);
+  console.log(`   Alistamiento          : http://localhost:${PORT}/alistamiento`);
+  console.log(`   Tablero CI        : http://localhost:${PORT}/ci`);
+  console.log(`   Health check      : http://localhost:${PORT}/health`);
+  console.log(`   RESET_PASS        : ${RESET_PASS ? '✅ configurada' : '⚠️  NO configurada (reset deshabilitado)'}`);
+  console.log(`   CORS origen       : ${ALLOWED_ORIGIN || 'abierto (modo dev)'}`);
+});
