@@ -1,0 +1,1320 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Tablero CI — Faltante de Insumos</title>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{ box-sizing:border-box; margin:0; padding:0; }
+body{ background:#f1f5f9; font-family:'IBM Plex Sans',sans-serif; color:#0f172a; min-height:100vh; overflow-x:hidden; }
+input,select,textarea{ font-size:16px !important; }
+:root{
+  --bg:#f1f5f9; --surface:#ffffff; --surface2:#f8fafc;
+  --accent:#2563eb; --accent2:#1e3a8a;
+  --text:#0f172a; --muted:#64748b; --border:#e2e8f0;
+  --danger:#ef4444; --warn:#f59e0b; --ok:#22c55e;
+  --purple:#8b5cf6; --teal:#0d9488;
+}
+
+/* ── LOADER ── */
+#ci-loader{
+  position:fixed;inset:0;z-index:9999;background:var(--bg);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
+}
+.ci-spin{
+  width:36px;height:36px;border:3px solid var(--border);
+  border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;
+}
+@keyframes spin{ to{ transform:rotate(360deg); } }
+
+/* ── TOPBAR ── */
+#ci-topbar{
+  position:sticky;top:0;z-index:100;background:#fff;
+  border-bottom:1px solid var(--border);
+  box-shadow:0 1px 6px rgba(0,0,0,.07);
+  padding:0 clamp(12px,2.5vw,24px);
+  min-height:60px;
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+}
+#ci-topbar::after{
+  content:'';position:absolute;bottom:0;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,#1e3a8a,#2563eb,#7c3aed);
+}
+.ci-tb-left{ display:flex;align-items:center;gap:10px; }
+.ci-tb-title{
+  font-family:'Barlow Condensed',sans-serif;font-size:clamp(16px,2.5vw,22px);
+  font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#0f172a;line-height:1.1;
+}
+.ci-tb-title span{ color:var(--accent); }
+.ci-tb-right{ display:flex;align-items:center;gap:8px; }
+.ci-conn-dot{
+  width:9px;height:9px;border-radius:50%;background:#94a3b8;
+  transition:background .4s;flex-shrink:0;
+}
+.ci-conn-dot.ok{ background:var(--ok); box-shadow:0 0 6px rgba(34,197,94,.5); }
+.ci-conn-dot.err{ background:var(--danger); }
+
+.ci-btn{
+  padding:7px 14px;border-radius:8px;border:1.5px solid var(--border);
+  background:#fff;color:var(--accent2);
+  font-family:'Barlow Condensed',sans-serif;font-size:13px;font-weight:700;
+  letter-spacing:.5px;cursor:pointer;transition:all .2s;
+  display:flex;align-items:center;gap:5px;
+}
+.ci-btn:hover{ background:var(--accent);color:#fff;border-color:var(--accent); }
+.ci-btn.danger:hover{ background:var(--danger);color:#fff;border-color:var(--danger); }
+.ci-btn.active{ background:var(--accent);color:#fff;border-color:var(--accent); }
+
+/* ── STATS BAR ── */
+#ci-stats{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:10px clamp(12px,2.5vw,24px);
+  background:#fff;border-bottom:1px solid var(--border);
+}
+.ci-stat{
+  display:flex;align-items:center;gap:6px;
+  padding:5px 12px;border-radius:20px;
+  font-family:'Barlow Condensed',sans-serif;font-size:13px;font-weight:700;letter-spacing:.5px;
+  cursor:pointer;border:1.5px solid transparent;transition:all .2s;
+}
+.ci-stat.all{ background:#f1f5f9;color:var(--muted);border-color:var(--border); }
+.ci-stat.alert{ background:#fef2f2;color:#b91c1c;border-color:#fca5a5; }
+.ci-stat.done{ background:#f0fdf4;color:#15803d;border-color:#86efac; }
+.ci-stat.active{ border-width:2px;box-shadow:0 2px 8px rgba(0,0,0,.08); }
+.ci-stat .ci-badge{
+  background:rgba(0,0,0,.1);border-radius:10px;
+  padding:1px 7px;font-size:12px;
+}
+.ci-stat-spacer{ flex:1; }
+
+/* ── MAIN GRID ── */
+#ci-main{
+  padding:16px clamp(12px,2.5vw,24px);
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
+  gap:16px;
+  align-items:start;
+}
+
+/* ── CARD ── */
+/* ── TARJETA ERP ── */
+.ci-card{
+  background:#fff;
+  border-radius:6px;
+  border:1px solid #d1d5db;
+  box-shadow:0 1px 4px rgba(0,0,0,.06);
+  overflow:hidden;
+  animation:slup .18s ease;
+  transition:box-shadow .15s;
+}
+.ci-card:hover{ box-shadow:0 3px 12px rgba(0,0,0,.1); }
+@keyframes slup{ from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:none;} }
+
+/* Borde izquierdo de color por estado — estilo ERP */
+.ci-card.status-alert   { border-left:3px solid #dc2626; }
+.ci-card.status-cumplido{ border-left:3px solid #d97706; }
+.ci-card.status-done    { border-left:3px solid #16a34a; opacity:.85; }
+
+/* Cabecera */
+.ci-card-hdr{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:10px 14px 9px;
+  background:#f9fafb;
+  border-bottom:1px solid #e5e7eb;
+}
+.ci-card-mod{
+  font-family:'IBM Plex Sans',sans-serif;font-size:14px;font-weight:700;
+  letter-spacing:.5px;color:#111827;text-transform:uppercase;
+}
+.ci-card-badge{
+  padding:2px 8px;border-radius:3px;
+  font-family:'IBM Plex Sans',sans-serif;font-size:10px;font-weight:700;
+  letter-spacing:.8px;text-transform:uppercase;border:1px solid;
+}
+.ci-card-badge.alert   { background:#fef2f2;color:#991b1b;border-color:#fca5a5; }
+.ci-card-badge.cumplido{ background:#fffbeb;color:#92400e;border-color:#fcd34d; }
+.ci-card-badge.done    { background:#f0fdf4;color:#166534;border-color:#86efac; }
+
+/* Tabla de datos */
+.ci-card-table{
+  width:100%;border-collapse:collapse;
+  font-family:'IBM Plex Sans',sans-serif;font-size:12px;
+}
+.ci-card-table tr{ border-bottom:1px solid #f3f4f6; }
+.ci-card-table tr:last-child{ border-bottom:none; }
+.ci-card-table td{ padding:6px 14px;vertical-align:middle; }
+.ci-card-table td:first-child{
+  font-size:10px;font-weight:600;letter-spacing:.8px;
+  text-transform:uppercase;color:#6b7280;
+  width:36%;background:#fafafa;
+  white-space:nowrap;
+}
+.ci-card-table td:last-child{
+  font-family:'IBM Plex Sans',sans-serif;font-size:13px;
+  font-weight:500;color:#111827;
+}
+/* Fila de T.Espera — resaltar valor */
+.ci-card-table .row-espera td:last-child{
+  font-weight:700;font-size:13px;color:#111827;
+  font-variant-numeric:tabular-nums;
+}
+
+/* Footer */
+.ci-card-footer{
+  display:flex;align-items:center;gap:6px;
+  padding:8px 14px 10px;
+  border-top:1px solid #e5e7eb;
+  background:#f9fafb;
+}
+.ci-action-btn{
+  padding:6px 14px;border-radius:4px;cursor:pointer;
+  font-family:'IBM Plex Sans',sans-serif;font-size:12px;font-weight:600;
+  letter-spacing:.3px;transition:all .15s;border:1px solid;
+}
+.ci-action-btn.cumplir{
+  flex:1;background:#166534;color:#fff;border-color:#166534;
+  padding:8px 14px;font-size:12px;letter-spacing:.5px;
+}
+.ci-action-btn.cumplir:hover{ background:#15803d;border-color:#15803d; }
+.ci-action-btn.cumplir:disabled{ background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;opacity:.7; }
+.ci-action-btn.obs{
+  background:#fff;color:#374151;border-color:#d1d5db;
+  font-size:11px;padding:6px 10px;
+}
+.ci-action-btn.obs:hover{ background:#f3f4f6; }
+.ci-action-btn.del{
+  background:#fff;color:#991b1b;border-color:#fca5a5;
+  padding:6px 10px;font-size:12px;
+}
+.ci-action-btn.del:hover{ background:#fef2f2; }
+
+/* ── EMPTY STATE ── */
+.ci-empty{
+  text-align:center;padding:60px 20px;color:var(--muted);
+  font-family:'Barlow Condensed',sans-serif;font-size:18px;letter-spacing:2px;
+}
+.ci-empty-icon{ font-size:48px;margin-bottom:12px; }
+
+/* ── MODAL BASE ── */
+.ci-modal-overlay{
+  position:fixed;inset:0;z-index:800;background:rgba(15,23,42,.55);
+  backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;padding:16px;
+}
+.ci-modal-overlay.open{ display:flex; }
+.ci-modal-box{
+  background:#fff;border-radius:18px;padding:28px 24px 22px;
+  width:100%;max-width:420px;box-shadow:0 24px 60px rgba(15,23,42,.25);
+  animation:slup .2s ease;
+}
+.ci-modal-title{
+  font-family:'Barlow Condensed',sans-serif;font-size:20px;font-weight:800;
+  letter-spacing:2px;text-transform:uppercase;color:var(--accent2);margin-bottom:4px;
+}
+.ci-modal-sub{ font-size:12px;color:var(--muted);margin-bottom:20px; }
+.ci-modal-label{
+  font-size:10px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase;
+  color:var(--muted);margin-bottom:6px;display:block;
+}
+.ci-modal-input{
+  width:100%;padding:10px 14px;border:1.5px solid var(--border);border-radius:10px;
+  font-family:'IBM Plex Sans',sans-serif;font-size:14px;color:var(--text);
+  background:#f8fafc;outline:none;margin-bottom:14px;
+}
+.ci-modal-input:focus{ border-color:var(--accent); }
+.ci-modal-btns{ display:flex;gap:10px;margin-top:8px; }
+.ci-modal-btn{
+  flex:1;padding:12px;border-radius:10px;border:none;cursor:pointer;
+  font-family:'Barlow Condensed',sans-serif;font-size:15px;font-weight:700;
+  letter-spacing:1px;transition:all .2s;
+}
+.ci-modal-btn.primary{ background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff; }
+.ci-modal-btn.primary:hover{ filter:brightness(1.1); }
+.ci-modal-btn.secondary{ background:#f1f5f9;color:var(--muted);border:1.5px solid var(--border); }
+.ci-modal-btn.secondary:hover{ background:var(--muted);color:#fff; }
+
+/* ── CONFIG SCREEN ── */
+#ci-config-screen{
+  display:none;position:fixed;inset:0;z-index:700;
+  background:var(--bg);overflow-y:auto;
+}
+.cfg-topbar{
+  position:sticky;top:0;z-index:10;background:#fff;
+  border-bottom:1px solid var(--border);padding:0 clamp(12px,2.5vw,24px);
+  min-height:56px;display:flex;align-items:center;justify-content:space-between;
+  box-shadow:0 1px 6px rgba(0,0,0,.06);
+}
+.cfg-title{
+  font-family:'Barlow Condensed',sans-serif;font-size:20px;font-weight:800;
+  letter-spacing:2px;text-transform:uppercase;color:var(--accent2);
+}
+.cfg-body{ padding:20px clamp(12px,2.5vw,24px);display:flex;flex-direction:column;gap:20px; }
+.cfg-section{
+  background:#fff;border-radius:14px;border:1.5px solid var(--border);
+  padding:18px 20px;box-shadow:0 1px 4px rgba(0,0,0,.03);
+}
+.cfg-sec-title{
+  font-family:'Barlow Condensed',sans-serif;font-size:16px;font-weight:800;
+  letter-spacing:1.5px;text-transform:uppercase;color:var(--accent2);margin-bottom:14px;
+}
+.cfg-chips{ display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px; }
+.cfg-chip{
+  display:flex;align-items:center;gap:6px;
+  padding:5px 10px 5px 12px;border-radius:20px;
+  background:#f1f5f9;border:1.5px solid var(--border);
+  font-family:'Barlow Condensed',sans-serif;font-size:13px;font-weight:700;letter-spacing:.5px;
+}
+.cfg-chip-del{
+  background:none;border:none;cursor:pointer;color:var(--muted);
+  font-size:14px;line-height:1;padding:0 2px;transition:color .2s;
+}
+.cfg-chip-del:hover{ color:var(--danger); }
+.cfg-add-row{ display:flex;gap:8px; }
+.cfg-add-input{
+  flex:1;padding:8px 12px;border:1.5px solid var(--border);border-radius:8px;
+  font-family:'IBM Plex Sans',sans-serif;font-size:14px;color:var(--text);
+  background:#f8fafc;outline:none;
+}
+.cfg-add-input:focus{ border-color:var(--accent); }
+.cfg-add-btn{
+  padding:8px 16px;border-radius:8px;border:none;cursor:pointer;
+  background:var(--accent);color:#fff;
+  font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:700;letter-spacing:.5px;
+  transition:filter .2s;
+}
+.cfg-add-btn:hover{ filter:brightness(1.1); }
+.cfg-flow-row{ display:flex;align-items:center;gap:8px;margin-bottom:8px; }
+.cfg-flow-sel{
+  padding:6px 10px;border:1.5px solid var(--border);border-radius:8px;
+  font-family:'IBM Plex Sans',sans-serif;font-size:13px;color:var(--text);
+  background:#f8fafc;outline:none;
+}
+
+/* ── TOAST ── */
+#ci-toast{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+  background:#0f172a;color:#fff;padding:12px 24px;border-radius:12px;
+  font-family:'IBM Plex Sans',sans-serif;font-size:14px;font-weight:700;
+  z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,.2);
+  animation:slup .2s ease;display:none;
+}
+
+/* ── RESPONSIVE ── */
+@media(max-width:600px){
+  .ci-card-field{ min-width:calc(50% - 4px); }
+  .ci-tb-right .ci-btn span{ display:none; }
+}
+
+/* ── Header estilo Tablero Planta ── */
+.hd-logo{
+  width:36px;height:36px;border-radius:50%;background:#fff;
+  display:flex;align-items:center;justify-content:center;overflow:hidden;
+  box-shadow:0 0 0 2px #e2e8f0,0 2px 8px rgba(0,0,0,.08);flex-shrink:0;
+}
+.hd-logo img{ width:100%;height:100%;object-fit:contain;padding:3px; }
+.hd-user-badge{
+  display:flex;align-items:center;gap:7px;padding:6px 14px;border-radius:8px;
+  background:#fff;border:1.5px solid var(--border);
+  font-family:'Barlow Condensed',sans-serif;font-size:clamp(11px,1.3vw,14px);
+  font-weight:700;color:#475569;letter-spacing:1.5px;text-transform:uppercase;
+}
+.hd-back-btn{
+  padding:6px 14px;border-radius:8px;border:1.5px solid var(--border);
+  background:#fff;color:var(--accent2);font-family:'IBM Plex Sans',sans-serif;
+  font-size:12px;font-weight:700;cursor:pointer;transition:all .2s;white-space:nowrap;
+}
+.hd-back-btn:hover{ background:#f1f5f9;border-color:#93c5fd; }
+</style>
+</head>
+<body>
+
+<!-- LOADER -->
+<div id="ci-loader">
+  <div class="ci-spin"></div>
+  <span style="font-size:13px;letter-spacing:2px;text-transform:uppercase;color:#94a3b8;font-family:'Barlow Condensed',sans-serif;">
+    Cargando tablero CI...
+  </span>
+  <div id="ci-debug" style="margin-top:16px;font-size:11px;color:#94a3b8;font-family:monospace;text-align:left;max-width:400px;line-height:1.8;"></div>
+</div>
+
+<!-- APP ROOT -->
+<div id="ci-app" style="display:none;">
+
+  <!-- TOPBAR — igual al de Tablero Planta -->
+  <header id="ci-topbar">
+    <div class="ci-tb-left">
+      <div class="hd-logo">
+        <img src="data:image/png;base64,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" alt="Logo">
+      </div>
+      <div>
+        <div class="ci-tb-title">TABLERO <span>CI</span></div>
+      </div>
+    </div>
+    <div class="ci-tb-right">
+      <div class="hd-user-badge">
+        <div class="ci-conn-dot" id="ci-conn-dot"></div>
+        <span id="ci-user-lbl"></span>
+      </div>
+      <button class="hd-back-btn" onclick="volverInicio()">← Volver</button>
+    </div>
+  </header>
+
+  <!-- STATS BAR -->
+  <div id="ci-stats">
+    <div class="ci-stat all active" id="sf-all" onclick="setFilter('all')">
+      Todos <span class="ci-badge" id="cnt-all">0</span>
+    </div>
+    <div class="ci-stat alert" id="sf-alert" onclick="setFilter('alert')">
+      🔴 Pendientes <span class="ci-badge" id="cnt-alert">0</span>
+    </div>
+    <div class="ci-stat done" id="sf-done" onclick="setFilter('done')">
+      ✅ Entregados <span class="ci-badge" id="cnt-done">0</span>
+    </div>
+    <div class="ci-stat-spacer"></div>
+    <div style="position:relative;" id="fecha-wrap">
+      <button class="hd-back-btn" onclick="toggleFechaPanel()" id="btn-fecha" style="display:flex;align-items:center;gap:6px;">
+        📅 <span id="btn-fecha-lbl">Fecha</span>
+      </button>
+      <div id="fecha-panel" style="display:none;position:absolute;top:110%;right:0;z-index:300;background:#fff;border:1.5px solid var(--border);border-radius:12px;padding:16px;box-shadow:0 8px 24px rgba(0,0,0,.12);min-width:240px;">
+        <div style="font-size:10px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:8px;">Desde</div>
+        <input type="date" id="ci-fecha-desde" style="width:100%;padding:7px 10px;border:1.5px solid var(--border);border-radius:8px;font-family:'IBM Plex Sans',sans-serif;font-size:13px;margin-bottom:10px;outline:none;">
+        <div style="font-size:10px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:8px;">Hasta</div>
+        <input type="date" id="ci-fecha-hasta" style="width:100%;padding:7px 10px;border:1.5px solid var(--border);border-radius:8px;font-family:'IBM Plex Sans',sans-serif;font-size:13px;margin-bottom:14px;outline:none;">
+        <div style="display:flex;gap:8px;">
+          <button onclick="aplicarFecha()" style="flex:1;padding:8px;border-radius:8px;border:none;background:#2563eb;color:#fff;font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:700;letter-spacing:.5px;cursor:pointer;">Filtrar</button>
+          <button onclick="limpiarFecha()" style="flex:1;padding:8px;border-radius:8px;border:1.5px solid var(--border);background:#fff;color:var(--muted);font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:700;cursor:pointer;">Limpiar</button>
+        </div>
+      </div>
+    </div>
+    <button class="hd-back-btn" onclick="exportarExcel()" style="background:#f0fdf4;border-color:#86efac;color:#15803d;">📥 Excel</button>
+    <button class="hd-back-btn" onclick="abrirConfig()" title="Configuración" style="padding:6px 10px;">⚙️</button>
+  </div>
+
+  <!-- CARDS -->
+  <div id="ci-main"></div>
+
+</div>
+
+<!-- Modal obs eliminado — reemplazado por dropdown -->
+
+<!-- MODAL: Confirm delete con contraseña -->
+<div class="ci-modal-overlay" id="modal-del">
+  <div class="ci-modal-box">
+    <div class="ci-modal-title">🗑 Eliminar solicitud</div>
+    <div class="ci-modal-sub" id="modal-del-sub" style="margin-bottom:16px;"></div>
+    <label class="ci-modal-label">Contraseña de administrador</label>
+    <input type="password" class="ci-modal-input" id="modal-del-pass" placeholder="••••••"
+      onkeydown="if(event.key==='Enter') confirmarDel()">
+    <div id="modal-del-err" style="display:none;color:var(--danger);font-size:12px;font-weight:700;margin-bottom:10px;"></div>
+    <div class="ci-modal-btns">
+      <button class="ci-modal-btn secondary" onclick="cerrarModalDel()">Cancelar</button>
+      <button class="ci-modal-btn primary" style="background:linear-gradient(135deg,#991b1b,#ef4444);" onclick="confirmarDel()">Eliminar</button>
+    </div>
+  </div>
+</div>
+
+<!-- CONFIG SCREEN -->
+<div id="ci-config-screen">
+  <div class="cfg-topbar">
+    <div class="cfg-title">⚙️ Configuración CI</div>
+    <button class="ci-btn" onclick="cerrarConfig()">← Volver</button>
+  </div>
+  <div class="cfg-body">
+
+    <!-- Tipos de insumo -->
+    <div class="cfg-section">
+      <div class="cfg-sec-title">📦 Tipos de Insumo</div>
+      <div class="cfg-chips" id="cfg-tipos-chips"></div>
+      <div class="cfg-add-row">
+        <input class="cfg-add-input" id="cfg-tipo-input" type="text" placeholder="Nuevo tipo (ej: Cierres)">
+        <button class="cfg-add-btn" onclick="cfgAddTipo()">+ Agregar</button>
+      </div>
+    </div>
+
+    <!-- Observaciones predefinidas -->
+    <div class="cfg-section">
+      <div class="cfg-sec-title">📝 Observaciones rápidas</div>
+      <div class="cfg-chips" id="cfg-obs-chips"></div>
+      <div class="cfg-add-row">
+        <input class="cfg-add-input" id="cfg-obs-input" type="text" placeholder="Nueva observación">
+        <button class="cfg-add-btn" onclick="cfgAddObs()">+ Agregar</button>
+      </div>
+    </div>
+
+    <!-- Sonido de alerta -->
+    <div class="cfg-section">
+      <div class="cfg-sec-title">🔔 Sonido de Alerta</div>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px;">Selecciona el sonido que suena al llegar una nueva solicitud.</p>
+      <div id="cfg-sound-options" style="display:flex;flex-direction:column;gap:8px;"></div>
+    </div>
+
+    <button class="ci-modal-btn primary" style="width:100%;padding:14px;" onclick="cfgGuardar()">
+      💾 Guardar configuración
+    </button>
+
+  </div>
+</div>
+
+
+
+<!-- TOAST -->
+<div id="ci-toast"></div>
+
+<script>
+// ══════════════════════════════════════════════════════
+//  Tablero_CI.html — Faltante de Insumos
+//  Se comunica con server.js vía WebSocket
+// ══════════════════════════════════════════════════════
+
+function dbg(msg){
+  console.log('[CI]', msg);
+  const el = document.getElementById('ci-debug');
+  if(el) el.innerHTML += '• ' + msg + '<br>';
+}
+
+// ── Parámetros URL ──
+const _params    = new URLSearchParams(window.location.search);
+const currentUser = _params.get('perfil') || _params.get('user') || 'CI';
+const esModoMec   = _params.get('mec') === '1';  // Mecánico solicitando
+
+// ── Estado global ──
+let ciRequests   = [];
+let ciConfig     = { tipoInsumoList:[], elasticoList:[], moduleList:[], obsList:[] };
+let wsReady      = false;
+let reconnectDelay = 1000;
+let reconnectTimer = null;
+let _filterStatus  = 'all';
+let _filterMod = '';
+let _timerInterval = null;
+let _pendingDelId  = null;
+
+// ── WebSocket ──
+let ws;
+
+function wsSend(obj){
+  if(ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+function connectWS(){
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url   = `${proto}://${location.host}`;
+  dbg('Conectando WS → ' + url);
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    wsReady = true;
+    reconnectDelay = 1000;
+    clearTimeout(reconnectTimer);
+    setDot(true);
+    dbg('WS conectado ✓');
+    // El servidor manda 'init' automáticamente al conectar
+    // pero también pedimos ci_init por si acaso
+    setTimeout(() => wsSend({ type: 'ci_init' }), 100);
+  };
+
+  ws.onmessage = (e) => {
+    try{
+      const msg = JSON.parse(e.data);
+      dbg('msg: ' + msg.type);
+
+      // El servidor manda 'init' al conectar — aprovechar para pedir ci_init
+      if(msg.type === 'init'){
+        dbg('init del servidor recibido — pidiendo ci_init');
+        wsSend({ type: 'ci_init' });
+        return;
+      }
+
+      if(msg.type === 'ci_init'){
+        ciRequests = msg.requests || [];
+        if(msg.tipoInsumoList) ciConfig.tipoInsumoList = msg.tipoInsumoList;
+        if(msg.elasticoList)   ciConfig.elasticoList   = msg.elasticoList;
+        if(msg.moduleList)     ciConfig.moduleList     = msg.moduleList;
+        if(msg.obsList)        ciConfig.obsList        = msg.obsList;
+        arrancar();
+
+      } else if(msg.type === 'ci_new_request'){
+        if(!ciRequests.find(r => r._id === msg.request._id)){
+          ciRequests.unshift(msg.request);
+        }
+        renderCards();
+        playAlertSound();
+        showToast('📦 Nueva solicitud de ' + (msg.request.module || ''));
+
+      } else if(msg.type === 'ci_update_request'){
+        const idx = ciRequests.findIndex(r => r._id === msg.request._id);
+        if(idx > -1) ciRequests[idx] = msg.request;
+        else ciRequests.unshift(msg.request);
+        renderCards();
+
+      } else if(msg.type === 'ci_delete_request'){
+        if(msg.reqId) ciRequests = ciRequests.filter(r => r._id !== msg.reqId);
+        else if(typeof msg.idx === 'number') ciRequests.splice(msg.idx, 1);
+        renderCards();
+
+      } else if(msg.type === 'ci_config_sync'){
+        if(msg.tipoInsumoList) ciConfig.tipoInsumoList = msg.tipoInsumoList;
+        if(msg.elasticoList)   ciConfig.elasticoList   = msg.elasticoList;
+        if(msg.moduleList)     ciConfig.moduleList     = msg.moduleList;
+        if(msg.obsList)        ciConfig.obsList        = msg.obsList;
+            }
+
+    } catch(err){ dbg('Error parseando: ' + err.message); }
+  };
+
+  ws.onclose = () => {
+    wsReady = false;
+    setDot(false);
+    dbg('WS cerrado — reconectando en ' + reconnectDelay + 'ms');
+    reconnectTimer = setTimeout(() => {
+      reconnectDelay = Math.min(reconnectDelay * 1.5, 15000);
+      connectWS();
+    }, reconnectDelay);
+  };
+
+  ws.onerror = (e) => { dbg('WS error'); };
+}
+
+function setDot(ok){
+  const d = document.getElementById('ci-conn-dot');
+  if(!d) return;
+  d.className = 'ci-conn-dot' + (ok ? ' ok' : ' err');
+}
+
+// ── Exportar Excel .xlsx con SheetJS ──
+function exportarExcel(){
+  const desde = document.getElementById('ci-fecha-desde').value;
+  const hasta  = document.getElementById('ci-fecha-hasta').value;
+  let data = ciRequests.slice();
+  data = filtrarPorFecha(data);
+  const statusLabel = s => s==='done'?'Entregado':s==='cumplido'?'Listo':s==='alert'?'Pendiente':s||'';
+
+  if(typeof XLSX !== 'undefined'){
+    // SheetJS disponible — generar .xlsx real
+    const rows = data.map(r => ({
+      'Módulo':         r.module||'',
+      'Tipo':           r.categoria||'Falta de Insumo',
+      'Referencia':     r.ref||'',
+      'OP / OC':        r.op||'',
+      'Insumo':         (r.tipo||'').replace(/\s*·\s*.+$/,''),
+      'Cantidad':       r.qty||'',
+      'Talla':          r.talla||'',
+      'Fecha':          r.fecha||'',
+      'Hora Inicio':    r.hora||'',
+      'Hora Fin':       r.resolvedAt||'',
+      'T. Espera (min)':r.waitTime!=null ? Math.round(r.waitTime/60) : '',
+      'Estado':         statusLabel(r.status),
+      'Obs.':           r.obs||''
+    }));
+    const ws = XLSX.utils.json_to_sheet(rows);
+    ws['!cols'] = [{wch:10},{wch:22},{wch:14},{wch:14},{wch:20},
+                   {wch:10},{wch:8},{wch:14},{wch:14},{wch:14},{wch:14},{wch:12},{wch:20}];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'CI');
+    const label = desde===hasta ? (desde||fechaLocal()) : (desde||'')+'_'+(hasta||'');
+    const fname = 'CI_'+label.replace(/\//g,'-')+'.xlsx';
+    XLSX.writeFile(wb, fname);
+    showToast('📥 Descargado: '+fname);
+  } else {
+    // Fallback: CSV con BOM para que Excel lo abra bien
+    const headers = ['Módulo','Tipo','Referencia','OP/OC','Insumo','Cantidad','Talla','Fecha','Hora Inicio','Hora Fin','T.Espera(min)','Estado','Obs.'];
+    const rows = data.map(r => [
+      r.module||'', r.categoria||'Falta de Insumo', r.ref||'', r.op||'',
+      (r.tipo||'').replace(/\s*·\s*.+$/,''), r.qty||'', r.talla||'',
+      r.fecha||'', r.hora||'', r.resolvedAt||'',
+      r.waitTime!=null?Math.round(r.waitTime/60):'', statusLabel(r.status), r.obs||''
+    ]);
+    const csv = [headers,...rows].map(r=>r.map(c=>'"'+String(c).replace(/"/g,'""')+'"').join(',')).join('\r\n');
+    const blob = new Blob(['\uFEFF'+csv],{type:'text/csv;charset=utf-8'});
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    const label = desde===hasta?(desde||fechaLocal()):(desde||'')+'_'+(hasta||'');
+    a.href=url; a.download='CI_'+label.replace(/\//g,'-')+'.csv';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast('📥 Descargado (CSV)');
+  }
+}
+
+// ── Fecha helpers ──
+function fechaLocal(date){
+  // Formato YYYY-MM-DD en hora local
+  const d = date || new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,'0');
+  const day = String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+}
+
+function parseFechaReq(req){
+  // Intenta extraer fecha de req.fecha (dd/mm/yyyy) o req.alertStart
+  if(req.alertStart) return fechaLocal(new Date(req.alertStart));
+  if(req.fecha){
+    // formato es-CO: d/m/yyyy
+    const parts = req.fecha.split('/');
+    if(parts.length===3){
+      const [d,m,y] = parts;
+      return `${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
+    }
+  }
+  return null;
+}
+
+function initFechas(){
+  const hoy = fechaLocal();
+  // Siempre inicializar con el día actual si no hay valor
+  const desde = document.getElementById('ci-fecha-desde');
+  const hasta  = document.getElementById('ci-fecha-hasta');
+  if(!desde.value) desde.value = hoy;
+  if(!hasta.value)  hasta.value  = hoy;
+  actualizarBtnFechaLbl();
+}
+
+function toggleFechaPanel(){
+  const panel = document.getElementById('fecha-panel');
+  panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
+}
+
+function aplicarFecha(){
+  document.getElementById('fecha-panel').style.display = 'none';
+  actualizarBtnFechaLbl();
+  renderCards();
+}
+
+function limpiarFecha(){
+  const hoy = fechaLocal();
+  document.getElementById('ci-fecha-desde').value = hoy;
+  document.getElementById('ci-fecha-hasta').value = hoy;
+  document.getElementById('fecha-panel').style.display = 'none';
+  actualizarBtnFechaLbl();
+  renderCards();
+}
+
+function actualizarBtnFechaLbl(){
+  const desde = document.getElementById('ci-fecha-desde').value;
+  const hasta = document.getElementById('ci-fecha-hasta').value;
+  const lbl   = document.getElementById('btn-fecha-lbl');
+  if(!desde && !hasta){ lbl.textContent = 'Fecha'; return; }
+  if(desde === hasta) lbl.textContent = desde;
+  else lbl.textContent = (desde||'…') + ' → ' + (hasta||'…');
+}
+
+function filtrarPorFecha(list){
+  const hoy   = fechaLocal();
+  const desde = document.getElementById('ci-fecha-desde').value || hoy;
+  const hasta = document.getElementById('ci-fecha-hasta').value || hoy;
+  if(!desde && !hasta) return list;
+  return list.filter(r => {
+    const f = parseFechaReq(r);
+    if(!f) return true;
+    if(desde && f < desde) return false;
+    if(hasta && f > hasta) return false;
+    return true;
+  });
+}
+
+
+// ── Arrancar ──
+function arrancar(){
+  dbg('Arrancando — ' + ciRequests.length + ' solicitudes');
+  document.getElementById('ci-loader').style.display = 'none';
+  document.getElementById('ci-app').style.display    = 'block';
+  initFechas();
+  renderCards();
+  startTimers();
+}
+
+
+// ── Formato tiempo ──
+function fmtElapsed(ms){
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  if(h > 0) return `${h}h ${m % 60}m`;
+  if(m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+function timerClass(ms){
+  const min = ms / 60000;
+  if(min >= 15) return 'danger';
+  if(min >= 7)  return 'warn';
+  return '';
+}
+
+// ── Render principal ──
+function renderCards(){
+  _filterMod = '';
+  const main = document.getElementById('ci-main');
+  main.innerHTML = '';
+
+  let visible = ciRequests.slice();
+  visible = filtrarPorFecha(visible);
+  if(_filterMod) visible = visible.filter(r => r.module === _filterMod);
+
+  const pending = visible.filter(r => r.status === 'alert' || r.status === 'cumplido');
+  const done    = visible.filter(r => r.status === 'done');
+
+  // Stats
+  document.getElementById('cnt-all').textContent   = visible.length;
+  document.getElementById('cnt-alert').textContent  = pending.length;
+  document.getElementById('cnt-done').textContent   = done.length;
+
+  // Filter highlight
+  ['all','alert','done'].forEach(f => {
+    document.getElementById('sf-'+f).classList.toggle('active', _filterStatus === f);
+  });
+
+  let toShow = [];
+  if(_filterStatus === 'all')   toShow = visible;
+  else if(_filterStatus === 'alert') toShow = pending;
+  else if(_filterStatus === 'done')  toShow = done;
+
+  if(toShow.length === 0){
+    main.innerHTML = `<div class="ci-empty"><div class="ci-empty-icon">📦</div>No hay solicitudes${_filterStatus !== 'all' ? ' en este filtro' : ''}</div>`;
+    return;
+  }
+
+  // Pending primero, luego done
+  const sorted = [
+    ...toShow.filter(r => r.status === 'alert' || r.status === 'cumplido'),
+    ...toShow.filter(r => r.status === 'done')
+  ];
+
+  sorted.forEach(req => {
+    const card = buildCard(req);
+    main.appendChild(card);
+  });
+}
+
+// ── Formato hora sin segundos ──
+function fmtHora(str){
+  if(!str) return '—';
+  // Si ya es un string de hora (ej: "1:19:51 p. m."), quitar los segundos
+  // Patrones: "H:MM:SS a. m." / "HH:MM:SS p. m." (es-CO) o "HH:MM:SS"
+  const mES = str.match(/^(\d{1,2}:\d{2}):\d{2}(\s*[ap]\.\s*m\.)?$/i);
+  if(mES) return mES[1] + (mES[2] ? mES[2].replace(/\s+/g,' ').trim() : '');
+  // Si viene de alertStart (timestamp), formatearlo
+  return str;
+}
+
+function fmtHoraFromMs(ts){
+  if(!ts) return '—';
+  return new Date(ts).toLocaleTimeString('es-CO',{hour:'numeric',minute:'2-digit',hour12:true});
+}
+
+// ── T. Espera en decimal de minutos ──
+function calcTEsperaDecimal(ms){
+  // ms → minutos decimales, 2 decimales
+  const min = ms / 60000;
+  return min.toFixed(2);
+}
+
+function buildCard(req){
+  const isDone = req.status === 'done';
+  const isCump = req.status === 'cumplido';
+  const isProd = (req.categoria || '').toLowerCase().includes('producci');
+
+  const div = document.createElement('div');
+  div.className = `ci-card status-${req.status || 'alert'}`;
+  div.dataset.id         = req._id;
+  div.dataset.alertStart = req.alertStart || '';
+  div.dataset.isDone     = isDone ? '1' : '0';
+
+  // Badge texto limpio — sin emojis, estilo ERP
+  const badgeLabel = isDone ? 'ENTREGADO' : isCump ? 'LISTO' : 'PENDIENTE';
+
+  // Horas sin segundos
+  const horaInicio = req.alertStart ? fmtHoraFromMs(req.alertStart) : fmtHora(req.hora);
+  const horaFin    = req.resolvedAt ? fmtHora(req.resolvedAt) : '';
+
+  // T. Espera en minutos decimales
+  const tEsperaInicial = isDone
+    ? (req.waitTime != null ? calcTEsperaDecimal(req.waitTime) : '')
+    : (req.alertStart ? calcTEsperaDecimal(Date.now() - req.alertStart) : '');
+
+  // Campos — vacíos si no hay datos
+  const insumo    = (req.tipo || '').replace(/\s*·\s*.+$/, '');
+  const categoria = req.categoria || '';
+  const talla     = req.talla  || '';
+  const ref       = req.ref    || '';
+  const op        = req.op     || '';
+  const qty       = req.qty    || '';
+
+  // Multi-insumo: filas adicionales
+  let extraInsumos = '';
+  if(req.insumos && req.insumos.length > 1){
+    extraInsumos = req.insumos.slice(1).map(ins => `
+      <tr>
+        <td style="padding-left:20px;color:#9ca3af;">↳</td>
+        <td style="font-weight:500;color:#374151;">
+          ${ins.tipo || ''}
+          ${ins.qty ? `<span style="margin-left:6px;color:#6b7280;font-size:11px;">× ${ins.qty}</span>` : ''}
+          ${ins.talla ? `<span style="margin-left:4px;color:#9ca3af;font-size:11px;">${ins.talla}</span>` : ''}
+        </td>
+      </tr>`).join('');
+  }
+
+  // Obs no obligatoria para Solicitud de Producción
+  const cumplirDisabled = !isDone && !isProd && !req.obs;
+  const cumplirTitle    = cumplirDisabled ? 'Agrega una observación antes de marcar cumplido' : '';
+
+  // Dropdown observación inline
+  const obsCell = !isDone ? `
+    <td style="padding:4px 14px 4px 0;">
+      <div style="position:relative;" id="obs-wrap-${req._id}">
+        <button onclick="toggleObsMenu('${req._id}')"
+          style="padding:4px 10px;border-radius:3px;border:1px solid #d1d5db;background:#fff;cursor:pointer;font-family:'IBM Plex Sans',sans-serif;font-size:11px;color:#374151;white-space:nowrap;display:flex;align-items:center;gap:4px;transition:background .12s;"
+          onmouseenter="this.style.background='#f3f4f6'" onmouseleave="this.style.background='#fff'">
+          ${req.obs
+            ? `<span style="max-width:110px;overflow:hidden;text-overflow:ellipsis;display:inline-block;font-weight:600;color:#111827;">${req.obs}</span>&nbsp;▾`
+            : `<span style="color:#9ca3af;">Seleccionar ▾</span>`}
+        </button>
+        <div id="obs-menu-${req._id}" style="display:none;position:absolute;top:110%;right:0;z-index:200;background:#fff;border:1px solid #d1d5db;border-radius:4px;box-shadow:0 4px 16px rgba(0,0,0,.1);min-width:170px;padding:4px 0;"></div>
+      </div>
+    </td>` : `<td></td>`;
+
+  div.innerHTML = `
+    <div class="ci-card-hdr">
+      <div class="ci-card-mod">${req.module || ''}</div>
+      <span class="ci-card-badge ${req.status || 'alert'}">${badgeLabel}</span>
+    </div>
+    <table class="ci-card-table">
+      <tr><td>Tipo</td>        <td>${categoria}</td></tr>
+      <tr><td>Referencia</td>  <td>${ref}</td></tr>
+      <tr><td>OP / OC</td>     <td>${op}</td></tr>
+      <tr><td>Insumo</td>      <td>${insumo}</td></tr>
+      ${extraInsumos}
+      <tr><td>Cantidad</td>    <td>${qty}</td></tr>
+      <tr><td>Talla</td>       <td>${talla}</td></tr>
+      <tr><td>Hora Inicio</td> <td>${horaInicio}</td></tr>
+      <tr><td>Hora Fin</td>    <td>${horaFin}</td></tr>
+      <tr class="row-espera"><td>T. Espera</td><td class="ci-tespera-val">${tEsperaInicial}</td></tr>
+      <tr><td>Observación</td>${obsCell}</tr>
+    </table>
+    <div class="ci-card-footer">
+      ${!isDone ? `
+        <button class="ci-action-btn cumplir" style="flex:1;" onclick="marcarCumplido('${req._id}')"
+          ${cumplirDisabled ? `disabled title="${cumplirTitle}"` : ''}>
+          Marcar Cumplido
+        </button>
+        <button class="ci-action-btn del" onclick="abrirDel('${req._id}')">🗑</button>
+      ` : `
+        <button class="ci-action-btn del" style="width:100%;" onclick="abrirDel('${req._id}')">Eliminar registro</button>
+      `}
+    </div>
+  `;
+  return div;
+}
+
+// ── Timer en vivo — actualiza T. Espera en decimal de minutos cada 5s ──
+function startTimers(){
+  if(_timerInterval) clearInterval(_timerInterval);
+  _timerInterval = setInterval(() => {
+    const now = Date.now();
+    document.querySelectorAll('.ci-card').forEach(card => {
+      if(card.dataset.isDone === '1') return; // done no cambia
+      const alertStart = parseInt(card.dataset.alertStart);
+      if(!alertStart) return;
+      const el = card.querySelector('.ci-tespera-val');
+      if(!el) return;
+      el.textContent = calcTEsperaDecimal(now - alertStart);
+    });
+  }, 5000); // cada 5 segundos — liviano y preciso
+}
+
+
+
+// ── Filtros ──
+function setFilter(f){
+  _filterStatus = f;
+  renderCards();
+}
+
+// ── Marcar cumplido ──
+function marcarCumplido(id){
+  const req = ciRequests.find(r => r._id === id);
+  if(!req) return;
+  const updated = Object.assign({}, req, {
+    status:     'cumplido',
+    resolvedAt: new Date().toLocaleTimeString('es-CO'),
+    waitTime:   req.alertStart ? Date.now() - req.alertStart : 0
+  });
+  // Actualizar localmente
+  const idx = ciRequests.findIndex(r => r._id === id);
+  if(idx > -1) ciRequests[idx] = updated;
+  // Broadcast a módulos (ellos ven modal de confirmación)
+  wsSend({ type: 'ci_cumplido_request', request: updated });
+  // También actualizar en servidor
+  wsSend({ type: 'ci_update_request',   request: updated });
+  renderCards();
+  showToast('📦 Insumo marcado como cumplido para ' + (req.module || ''));
+}
+
+// ── Dropdown Observación ──
+let _obsMenuOpen = null;
+
+function toggleObsMenu(id){
+  // Cerrar cualquier menú abierto
+  if(_obsMenuOpen && _obsMenuOpen !== id){
+    const prev = document.getElementById('obs-menu-'+_obsMenuOpen);
+    if(prev) prev.style.display = 'none';
+  }
+  const menu = document.getElementById('obs-menu-'+id);
+  if(!menu) return;
+  const isOpen = menu.style.display === 'block';
+  menu.style.display = isOpen ? 'none' : 'block';
+  _obsMenuOpen = isOpen ? null : id;
+  if(!isOpen) buildObsMenu(id, menu);
+}
+
+function buildObsMenu(id, menu){
+  const req = ciRequests.find(r => r._id === id);
+  menu.innerHTML = '';
+  // Opciones predefinidas de ciConfig.obsList
+  const opts = ciConfig.obsList && ciConfig.obsList.length ? ciConfig.obsList : ['Pérdida','Faltante','Defectos'];
+  opts.forEach(obs => {
+    const item = document.createElement('div');
+    item.style.cssText = 'padding:9px 16px;cursor:pointer;font-family:"IBM Plex Sans",sans-serif;font-size:13px;color:#0f172a;transition:background .15s;';
+    item.textContent = obs;
+    if(req && req.obs === obs) item.style.fontWeight = '700';
+    item.onmouseenter = () => item.style.background = '#f1f5f9';
+    item.onmouseleave = () => item.style.background = '';
+    item.onclick = () => guardarObsDirecta(id, obs);
+    menu.appendChild(item);
+  });
+  // Separador + Limpiar obs
+  if(req && req.obs){
+    const sep = document.createElement('div');
+    sep.style.cssText = 'height:1px;background:#e2e8f0;margin:4px 0;';
+    menu.appendChild(sep);
+    const clear = document.createElement('div');
+    clear.style.cssText = 'padding:9px 16px;cursor:pointer;font-family:"IBM Plex Sans",sans-serif;font-size:13px;color:#94a3b8;transition:background .15s;';
+    clear.textContent = '✕ Quitar observación';
+    clear.onmouseenter = () => clear.style.background = '#f1f5f9';
+    clear.onmouseleave = () => clear.style.background = '';
+    clear.onclick = () => guardarObsDirecta(id, '');
+    menu.appendChild(clear);
+  }
+}
+
+function guardarObsDirecta(id, obs){
+  const menu = document.getElementById('obs-menu-'+id);
+  if(menu) menu.style.display = 'none';
+  _obsMenuOpen = null;
+  const req = ciRequests.find(r => r._id === id);
+  if(!req) return;
+  const updated = Object.assign({}, req, { obs });
+  const idx = ciRequests.findIndex(r => r._id === id);
+  if(idx > -1) ciRequests[idx] = updated;
+  wsSend({ type: 'ci_update_request', request: updated });
+  renderCards();
+  showToast(obs ? '📝 Observación guardada' : '📝 Observación eliminada');
+}
+
+// Cerrar menú al hacer click afuera
+document.addEventListener('click', e => {
+  // Cerrar panel de fecha al click afuera
+  if(!e.target.closest('#fecha-wrap')){
+    const fp = document.getElementById('fecha-panel');
+    if(fp) fp.style.display = 'none';
+  }
+  if(_obsMenuOpen && !e.target.closest('[id^="obs-wrap-"]')){
+    const menu = document.getElementById('obs-menu-'+_obsMenuOpen);
+    if(menu) menu.style.display = 'none';
+    _obsMenuOpen = null;
+  }
+});
+
+// ── Modal Eliminar con contraseña admin ──
+function abrirDel(id){
+  _pendingDelId = id;
+  const req = ciRequests.find(r => r._id === id);
+  const sub = document.getElementById('modal-del-sub');
+  if(sub) sub.textContent = req
+    ? `Solicitud de ${req.tipo} — módulo ${req.module}`
+    : 'Solicitud seleccionada';
+  const passEl = document.getElementById('modal-del-pass');
+  if(passEl){ passEl.value=''; }
+  const errEl = document.getElementById('modal-del-err');
+  if(errEl){ errEl.style.display='none'; }
+  document.getElementById('modal-del').classList.add('open');
+  setTimeout(()=>{ if(passEl) passEl.focus(); }, 100);
+}
+function cerrarModalDel(){
+  document.getElementById('modal-del').classList.remove('open');
+  _pendingDelId = null;
+}
+function confirmarDel(){
+  if(!_pendingDelId) return;
+  const pass   = (document.getElementById('modal-del-pass')?.value || '').trim();
+  const errEl  = document.getElementById('modal-del-err');
+  // Verificar contraseña contra los usuarios con permiso admin/fix
+  const ADMIN_PASS = Object.values(window._adminPasswords||{});
+  if(!pass){ if(errEl){errEl.textContent='Ingresa la contraseña de administrador';errEl.style.display='block';} return; }
+  // Llamar al servidor para verificar
+  fetch('/api/app-config')
+    .then(r=>r.json())
+    .then(cfg=>{
+      // Buscar en usuarios extra o builtin con permiso 'fix'
+      const usuarios = cfg._usuarios_extra || [];
+      const valid = usuarios.some(u => u.pass === pass && (u.perms||[]).includes('fix'))
+                 || pass === '1'; // Programador builtin
+      if(!valid){
+        if(errEl){errEl.textContent='Contraseña incorrecta';errEl.style.display='block';}
+        return;
+      }
+      const id  = _pendingDelId;
+      const idx = ciRequests.findIndex(r => r._id === id);
+      if(idx > -1) ciRequests.splice(idx, 1);
+      wsSend({ type: 'ci_delete_request', reqId: id });
+      cerrarModalDel();
+      renderCards();
+          showToast('🗑 Solicitud eliminada');
+    })
+    .catch(()=>{
+      if(errEl){errEl.textContent='Error al verificar. Intenta de nuevo.';errEl.style.display='block';}
+    });
+}
+
+// ── Config ──
+function abrirConfig(){
+  renderCfgChips();
+  renderSoundOptions();
+  document.getElementById('ci-config-screen').style.display = 'block';
+}
+function cerrarConfig(){
+  document.getElementById('ci-config-screen').style.display = 'none';
+}
+
+function renderCfgChips(){
+  renderChipList('cfg-tipos-chips', ciConfig.tipoInsumoList.map(t=>t.name), cfgDelTipo);
+  renderChipList('cfg-obs-chips', ciConfig.obsList, cfgDelObs);
+}
+
+function renderChipList(containerId, items, delFn){
+  const c = document.getElementById(containerId);
+  if(!c) return;
+  c.innerHTML = '';
+  items.forEach((item, i) => {
+    const chip = document.createElement('div');
+    chip.className = 'cfg-chip';
+    chip.innerHTML = `${item}<button class="cfg-chip-del" onclick='(${delFn.toString()})(${i})'>✕</button>`;
+    c.appendChild(chip);
+  });
+}
+
+function cfgDelTipo(i){ ciConfig.tipoInsumoList.splice(i,1); renderCfgChips(); }
+function cfgDelObs(i){ ciConfig.obsList.splice(i,1); renderCfgChips(); }
+
+function cfgAddTipo(){
+  const v = document.getElementById('cfg-tipo-input').value.trim();
+  if(!v) return;
+  ciConfig.tipoInsumoList.push({ name: v, flow: 'qty_talla' });
+  document.getElementById('cfg-tipo-input').value = '';
+  renderCfgChips();
+}
+function cfgAddObs(){
+  const v = document.getElementById('cfg-obs-input').value.trim();
+  if(!v) return;
+  ciConfig.obsList.push(v);
+  document.getElementById('cfg-obs-input').value = '';
+  renderCfgChips();
+}
+
+// ── Sonidos de alerta ──
+const CI_SOUNDS = [
+  { id: 'sirena1',  label: '🚨 Sirena clásica',            desc: 'Sube y baja como sirena de emergencia — 5s' },
+  { id: 'sirena2',  label: '🔴 Sirena rápida',             desc: 'Pulsos cortos alternados de sirena — 5s' },
+  { id: 'alarma',   label: '⚠️ Alarma industrial',         desc: 'Tono de alarma de fábrica pulsante — 5s' },
+  { id: 'klaxon',   label: '📢 Klaxon',                    desc: 'Bocina de alerta repetida — 5s' },
+  { id: 'ding3',    label: '🔔 Ding triple',               desc: 'Tres tonos suaves (menos intenso) — 5s' },
+  { id: 'none',     label: '🔇 Sin sonido',                desc: 'No reproducir ningún sonido' },
+];
+
+let _selectedSound = localStorage.getItem('ci_sound') || 'sirena1';
+
+function renderSoundOptions(){
+  const container = document.getElementById('cfg-sound-options');
+  if(!container) return;
+  container.innerHTML = '';
+  CI_SOUNDS.forEach(s => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:10px 14px;border-radius:10px;border:1.5px solid var(--border);background:#fafbfc;cursor:pointer;transition:all .15s;';
+    const isSelected = _selectedSound === s.id;
+    if(isSelected) row.style.cssText += 'border-color:var(--accent);background:#eff6ff;';
+    row.innerHTML = `
+      <div style="width:18px;height:18px;border-radius:50%;border:2px solid ${isSelected?'var(--accent)':'var(--border)'};background:${isSelected?'var(--accent)':'#fff'};flex-shrink:0;display:flex;align-items:center;justify-content:center;">
+        ${isSelected?'<div style="width:7px;height:7px;border-radius:50%;background:#fff;"></div>':''}
+      </div>
+      <div style="flex:1;">
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:700;letter-spacing:.5px;color:var(--text);">${s.label}</div>
+        <div style="font-size:11px;color:var(--muted);">${s.desc}</div>
+      </div>
+      <button onclick="event.stopPropagation();previewSound('${s.id}')" style="padding:5px 10px;border-radius:6px;border:1.5px solid var(--border);background:#fff;color:var(--muted);font-size:11px;font-weight:700;cursor:pointer;font-family:'Barlow Condensed',sans-serif;letter-spacing:.5px;">▶ Probar</button>
+    `;
+    row.onclick = () => { _selectedSound = s.id; localStorage.setItem('ci_sound',''); renderSoundOptions(); };
+    container.appendChild(row);
+  });
+}
+
+function previewSound(id){ _playSoundById(id); }
+
+function _playSoundById(id){
+  if(id === 'none') return;
+  try{
+    const ctx = new (window.AudioContext||window.webkitAudioContext)();
+    const now = ctx.currentTime;
+    const dur = 5.0; // todos duran 5 segundos
+
+    if(id === 'sirena1'){
+      // Sirena clásica: oscila lentamente entre tono bajo y alto, 5 ciclos en 5s
+      const cycles = 5;
+      for(let i = 0; i < cycles; i++){
+        const t = now + i * (dur / cycles);
+        const half = (dur / cycles) / 2;
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.connect(g); g.connect(ctx.destination);
+        o.type = 'sawtooth';
+        // Subir de 400Hz a 900Hz en la primera mitad
+        o.frequency.setValueAtTime(400, t);
+        o.frequency.linearRampToValueAtTime(900, t + half);
+        // Bajar de 900Hz a 400Hz en la segunda mitad
+        o.frequency.linearRampToValueAtTime(400, t + half * 2);
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.5, t + 0.05);
+        g.gain.setValueAtTime(0.5, t + half * 2 - 0.05);
+        g.gain.linearRampToValueAtTime(0, t + half * 2);
+        o.start(t); o.stop(t + half * 2);
+      }
+    } else if(id === 'sirena2'){
+      // Sirena rápida: pulsos cortos alternando dos frecuencias — 10 pulsos en 5s
+      const pulsos = 10;
+      const pDur = dur / pulsos;
+      for(let i = 0; i < pulsos; i++){
+        const t = now + i * pDur;
+        const freq = i % 2 === 0 ? 960 : 640;
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.connect(g); g.connect(ctx.destination);
+        o.type = 'square';
+        o.frequency.value = freq;
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.45, t + 0.03);
+        g.gain.setValueAtTime(0.45, t + pDur - 0.06);
+        g.gain.linearRampToValueAtTime(0, t + pDur - 0.01);
+        o.start(t); o.stop(t + pDur);
+      }
+    } else if(id === 'alarma'){
+      // Alarma industrial: tono fuerte pulsante con distorsión — 8 pulsos en 5s
+      const pulsos = 8;
+      const pDur = dur / pulsos;
+      for(let i = 0; i < pulsos; i++){
+        const t = now + i * pDur;
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.connect(g); g.connect(ctx.destination);
+        o.type = 'sawtooth';
+        o.frequency.setValueAtTime(520, t);
+        o.frequency.linearRampToValueAtTime(560, t + pDur * 0.6);
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.6, t + 0.02);
+        g.gain.setValueAtTime(0.6, t + pDur * 0.65);
+        g.gain.linearRampToValueAtTime(0, t + pDur * 0.75);
+        o.start(t); o.stop(t + pDur);
+      }
+    } else if(id === 'klaxon'){
+      // Klaxon/bocina: tono grave de bocina repetido — 5 bocinazos en 5s
+      const bocinazos = 5;
+      const bDur = dur / bocinazos;
+      for(let i = 0; i < bocinazos; i++){
+        const t = now + i * bDur;
+        // Dos osciladores para el efecto bocina
+        [280, 350].forEach(freq => {
+          const o = ctx.createOscillator();
+          const g = ctx.createGain();
+          o.connect(g); g.connect(ctx.destination);
+          o.type = 'sawtooth';
+          o.frequency.value = freq;
+          g.gain.setValueAtTime(0, t);
+          g.gain.linearRampToValueAtTime(0.3, t + 0.04);
+          g.gain.setValueAtTime(0.3, t + bDur * 0.7);
+          g.gain.linearRampToValueAtTime(0, t + bDur * 0.82);
+          o.start(t); o.stop(t + bDur);
+        });
+      }
+    } else if(id === 'ding3'){
+      // Ding triple ampliado a 5s: 3 dings bien espaciados
+      [{freq:1046,start:0,dur:2.0},{freq:880,start:1.5,dur:2.0},{freq:1318,start:3.0,dur:2.0}]
+      .forEach(({freq,start,d})=>{
+        const o=ctx.createOscillator(),g=ctx.createGain();
+        o.connect(g);g.connect(ctx.destination);
+        o.type='sine';o.frequency.setValueAtTime(freq,now+start);
+        g.gain.setValueAtTime(0,now+start);
+        g.gain.linearRampToValueAtTime(0.45,now+start+0.015);
+        g.gain.exponentialRampToValueAtTime(0.001,now+start+2.0);
+        o.start(now+start);o.stop(now+start+2.0);
+      });
+    }
+  } catch(e){ console.warn('Audio no disponible'); }
+}
+
+function cfgGuardar(){
+  localStorage.setItem('ci_sound', _selectedSound);
+  wsSend({
+    type:           'ci_config_sync',
+    tipoInsumoList: ciConfig.tipoInsumoList,
+    elasticoList:   ciConfig.elasticoList,
+    moduleList:     ciConfig.moduleList,
+    obsList:        ciConfig.obsList
+  });
+  cerrarConfig();
+  showToast('✅ Configuración guardada');
+}
+
+// Historial eliminado
+
+// ── Toast ──
+let _toastTimer;
+function showToast(msg){
+  const el = document.getElementById('ci-toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { el.style.display = 'none'; }, 2800);
+}
+
+// ── Volver ──
+function volverInicio(){
+  if(document.referrer && document.referrer !== window.location.href){
+    window.history.back();
+  } else {
+    window.location.href = '/';
+  }
+}
+
+// ── Cerrar modales con Esc ──
+document.addEventListener('keydown', e => {
+  if(e.key === 'Escape'){
+    cerrarModalDel();
+    cerrarConfig();
+  }
+});
+
+// ── Sonido de alerta — usa la preferencia guardada ──
+function playAlertSound(){
+  const id = localStorage.getItem('ci_sound') || 'sirena1';
+  _playSoundById(id);
+}
+
+// ── Poblar user label en header ──
+const _userLbl = document.getElementById('ci-user-lbl');
+if(_userLbl) _userLbl.textContent = currentUser.toUpperCase();
+
+// ── Iniciar ──
+connectWS();
+</script>
+</body>
+</html>
